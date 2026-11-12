@@ -40,7 +40,7 @@ $W = ".\scripts\win-harness.exe"
 | `read -Window <定位> [-Name <>\|-AutomationId <>] [-Index n]` | 读元素文本（Value→Text→Name） |
 | `getprop -Window <定位> [-Name <>\|-AutomationId <>] [-Index n]` | 读属性与支持的 Pattern |
 | `pixel -X -Y` | 取屏幕像素颜色 |
-| `ocr [-Window <定位> \| -X -Y -Width -Height] [-Upscale auto\|n] [-Lang <>] [-Capture auto\|screen\|window] [-Raise] [-Out <路径>]` | OCR 识别文字，返回**屏幕绝对坐标**（无 UIA 的自绘界面首选） |
+| `ocr [-Window <定位> \| -X -Y -Width -Height] [-Upscale auto\|n] [-Lang <>] [-Capture auto\|screen\|window] [-Raise] [-NoWords] [-Out <路径>]` | OCR 识别文字，返回**屏幕绝对坐标**（无 UIA 的自绘界面首选） |
 | `surfaces` | 列出 shell 表面：taskbar / taskbar2 / desktop / start / overflow / notifications |
 | `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd（之后用 `-Window shell:<名字>` 操作） |
 | `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
@@ -175,6 +175,8 @@ Chromium 系应用（Edge / Electron / WebView2 / Tauri）的 UIA 树极浅，�
 3. **中文按单字拆分**（`会 话 列 表`），做文本匹配前先去掉空格：`-replace '\s',''`。
 4. **只认文字**。图标、图形按钮、无字区域它看不见——那才轮到 `pixel` + `hover` 探测。
 
+**响应瘦身**：只要行级文本时加 `-NoWords`，省掉 word 级坐标数组——实测响应从 61.8KB 降到 13.8KB（-78%）。需要点具体某个词时才保留 words。
+
 ## 遮挡、抓取模式与 `-Raise`
 
 **这是最容易出错的一环**：`screenshot` / `ocr` 默认抓的是**屏幕像素**（`CopyFromScreen`），目标一旦被别的窗口盖住，就会**静默读到遮挡者的内容**，且不报错。
@@ -306,22 +308,28 @@ Chromium 系应用（Edge / Electron / WebView2 / Tauri）的 UIA 树极浅，�
 
 ## 性能与提速
 
-**每次调用都是一次新进程，启动约 40–60ms**，这才是多步操作慢的主因。实测：
+**每次调用都是一次新进程，启动约 40–60ms**，多步操作慢的主因在这里；但在大窗口（Electron/浏览器，2000+ 元素）上，**元素查找**才是大头。实测（OC Manager，Wails/Chromium 窗口）：
 
-| 操作 | 耗时 |
-|---|---|
-| `pixel`（最小命令，几乎纯启动） | 67ms |
-| `windows` | 197ms |
-| 单次 UIA `click`（`do` 内） | 19–38ms |
-| 小区域 `ocr` | 146ms |
-| 全窗 `ocr`（150% 屏，150 行） | ~1.1s |
+| 操作 | 优化前 | 优化后 |
+|---|---|---|
+| `find -AutomationId` | ~2000ms | **~400ms**（UIA 原生 `PropertyCondition` 过滤） |
+| `find -Name <x> -Exact` | ~2000ms | **~390ms**（同上） |
+| `find -Type Button` | ~2100ms | **~650ms**（`ControlType` 条件下推） |
+| `find -Name <x>`（模糊包含） | ~2000ms | ~1600ms（UIA 无法表达 contains，只能枚举 + 属性缓存） |
+| `pixel`（最小命令） | 67ms | 67ms |
+| `windows` | 197ms | 197ms |
+| 单次 UIA `click`（`do` 内） | 19–38ms | 19–38ms |
+| 5 次 `pixel` 分开调 | 330ms | 330ms |
+| 同样 5 次放进一个 `do` | — | **130ms** |
+| OCR 全窗 150 行（含 words） | 61.8KB 响应 | `-NoWords` 后 **13.8KB（-78%）** |
 
 **规则：**
 
-1. **多步操作写成一条 `do -Ops`**——7 步点击实测只起一次进程，比 7 次调用省约 400ms。这是最直接的提速手段。
-2. **别默认 `tree -Depth 5`**：WinUI/浏览器上深度 5–6 会拉到 200–500 个元素。先用 `-AutomationId` + `find` 精确定位；需要看结构再 `-Depth 2/3`。
-3. **OCR 只给区域**：`-X -Y -Width -Height` 只识别目标那块，比全窗快一个量级。
-4. **`-Trace` 平时关掉**，排障时才开。
+1. **多步操作写成一条 `do -Ops`** —— 5 步实测 330ms → 130ms；7 步点击只起一次进程。
+2. **优先用 `-AutomationId` 或 `-Name ... -Exact`**，两者走 UIA 原生过滤；**模糊 `-Name` 在 Electron/浏览器窗口上要 1.6 秒**，只在真不知道精确名称时用。
+3. **别默认 `tree -Depth 5`** —— WinUI/浏览器上深度 5–6 会拉 200–500 个元素。先 `find` 定位，需要看结构再 `-Depth 2/3`。
+4. **OCR 只给区域**（`-X -Y -Width -Height`），比全窗快一个量级；只要行级文本时加 `-NoWords`。
+5. **`-Trace` 平时关掉**，排障时才开。
 
 ## 工具路由（三堵墙，别硬啃）
 

@@ -18,6 +18,12 @@ namespace WinHarness {
         static Dictionary<string, string> _opts;   // 供 catch 写 trace（失败时也要记录参数）
         static Stopwatch _sw;
 
+        // 会改变界面的命令：执行前清掉元素枚举缓存，避免 find 命中过期元素
+        static readonly string[] Mutating = {
+            "click", "type", "setvalue", "key", "scroll", "drag",
+            "launch", "kill", "setwindow", "focus", "open", "clipboard"
+        };
+
         [STAThread] // 剪贴板操作要求 STA
         static int Main(string[] args) {
             try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
@@ -37,6 +43,8 @@ namespace WinHarness {
                 Console.WriteLine(B64.Encode(GetText(opts)));
                 return 0;
             }
+
+            if (Array.IndexOf(Mutating, cmd) >= 0) Uia.InvalidateAll();
 
                 object data = Dispatch(cmd, opts);
                 _sw.Stop();
@@ -1060,19 +1068,22 @@ namespace WinHarness {
             }
 
             // 原图像素坐标 + 截图区域原点 = 屏幕绝对坐标
+            bool noWords = Flag(o, "NoWords");   // 只要行级文本时省掉 word 数组，响应体积常降 30–50%
             var lines = new List<Dictionary<string, object>>();
             foreach (var l in (List<Dictionary<string, object>>)ocr["lines"]) {
                 var nl = new Dictionary<string, object>();
                 nl["text"] = l["text"];
                 OffsetInto(nl, l, rx, ry);
-                var ws = new List<Dictionary<string, object>>();
-                foreach (var wd in (List<Dictionary<string, object>>)l["words"]) {
-                    var nw = new Dictionary<string, object>();
-                    nw["text"] = wd["text"];
-                    OffsetInto(nw, wd, rx, ry);
-                    ws.Add(nw);
+                if (!noWords) {
+                    var ws = new List<Dictionary<string, object>>();
+                    foreach (var wd in (List<Dictionary<string, object>>)l["words"]) {
+                        var nw = new Dictionary<string, object>();
+                        nw["text"] = wd["text"];
+                        OffsetInto(nw, wd, rx, ry);
+                        ws.Add(nw);
+                    }
+                    nl["words"] = ws;
                 }
-                nl["words"] = ws;
                 lines.Add(nl);
             }
 

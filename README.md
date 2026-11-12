@@ -174,7 +174,25 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 - **任务栏 UIA 会间歇性返回空树**（同一 hwnd 先 27 个、稍后 0 个，按一次 `ESC` 后恢复——通常是开始菜单/弹出层残留压制了树）。已加 3 次重试，仍空则标 `uia(empty-after-retry)`。
 - **Win11 开始菜单是 `Wnd_StartFeed`**，不再是 `Windows.UI.Core.CoreWindow`（同标题的 CoreWindow 实测是「设置」）；且本机 `SendInput` 发 `VK_LWIN` 不弹开始菜单，所以改为优先点任务栏开始按钮。
 
+### 1.12 查找性能
+
+`find` 的性能差异极大，取决于谓词能否交给 UIA 自己过滤：
+
+| 谓词 | 实现 | 实测（Chromium 窗口，2000+ 元素） |
+|---|---|---|
+| `-AutomationId` / `-Name -Exact` / `-Class` | `PropertyCondition` / `AndCondition` 下推给 UIA | ~400ms |
+| `-Type` | `PropertyCondition(ControlTypeProperty)` | ~650ms |
+| `-Name`（模糊包含） | UIA 无法表达 `contains`，只能枚举 + `CacheRequest` 批量取属性 | ~1600ms |
+
+关键改动是把原来的「`FindAll(TrueCondition)` 全量搬到托管堆，再逐元素读 `Current.Name/Type/Class`（每元素 3–4 次 COM 往返）」换成两条更快的路径：
+
+1. **能表达成条件的直接交给 UIA**（`PropertyCondition` + `AndCondition`），托管侧只做最后校验。`ControlType` 名称→对象用反射建表（property 与 field 两种成员都要扫，不同 .NET 版本不一样）。
+2. **模糊匹配走 `CacheRequest`**：把 Name/AutomationId/ClassName/ControlType 一次性缓存回来，过滤读 `Cached.*` 而不是 `Current.*`。再叠加 400ms 的元素列表短缓存；**任何会改变界面的命令**（click/type/setvalue/key/scroll/drag/launch/kill/setwindow/focus/open/clipboard）执行前都会清掉缓存，避免命中过期元素。
+
+`do` 批处理的收益同样来自这里：5 次独立调用 330ms，合成一条 `do` 只需 130ms（省掉 4 次进程启动 + 4 次 UIA 初始化）。
+
 ## 二、功能
+
 
 
 ### 2.1 窗口管理
@@ -214,7 +232,7 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 |---|---|
 | `screenshot [-Window <定位>] [-Monitor n] [-Capture auto\|screen\|window] [-Raise] [-Out <路径>]` | 截图；带 `-Window` 时返回遮挡比例与覆盖者 |
 | `pixel -X -Y` | 取屏幕像素颜色（自绘 UI 的视觉验证手段） |
-| `ocr [-Window <定位> \| -X -Y -Width -Height] [-Upscale auto\|n] [-Lang <>] [-Capture auto\|screen\|window] [-Raise] [-Out <路径>]` | OCR 识别文字，返回行/词的**屏幕绝对坐标**；无 UIA 的自绘界面首选 |
+| `ocr [-Window <定位> \| -X -Y -Width -Height] [-Upscale auto\|n] [-Lang <>] [-Capture auto\|screen\|window] [-Raise] [-NoWords] [-Out <路径>]` | OCR 识别文字，返回行/词的**屏幕绝对坐标**；`-NoWords` 省掉词级数组（响应 -78%） |
 | `surfaces` | 列出 shell 表面（taskbar / taskbar2 / desktop / start / overflow / notifications） |
 | `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd |
 | `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd / 根窗口 / 进程 / 类名） |
@@ -340,6 +358,8 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 | 遮挡检测与 `-Raise` | 通过：完全遮挡 `occluded=1`，`-Raise` 后 `0`；UWP 自身窗口不误报 |
 | Trace / 错误码 | 通过：`do` 三步第 2 步失败 → 3 条 NDJSON 带 `step/of/code/retry`；`-Stats` 聚合正确 |
 | shell 表面 | 部分通过：`taskbar`（27–28 元素）、`taskbar2`、`desktop`、`overflow` 可用；`start` / `notifications` 为 best-effort，本机未验证通过 |
+| 查找性能（Chromium 窗口 2000+ 元素） | 通过：`-AutomationId` 2000→400ms，`-Name -Exact` 2000→390ms，`-Type` 2100→650ms，模糊 `-Name` 1600ms |
+| 回归套件（22 项，`wh-regress.ps1`） | 22/22 通过（微信窗口不可见时跳过该项） |
 
 ---
 

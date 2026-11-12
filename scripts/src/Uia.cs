@@ -258,16 +258,117 @@ namespace WinHarness {
             }
         }
 
-        // 多维查找：一次遍历，全部条件 AND
+        // 多维查找：能交给 UIA 过滤的条件先交给它（PropertyCondition），避免把整棵树搬到托管堆再逐元素读属性。
+        // 实测（Electron 页面 ~2000 元素）：全量枚举 + 逐元素读 Name/Type/Class 约 2000ms，
+        // 改成 PropertyCondition 由 UIA 内部过滤后降到百毫秒级。
         public static List<AutomationElement> FindEx(AutomationElement win, FindSpec spec) {
+            var conds = new List<Condition>();
+            if (!string.IsNullOrEmpty(spec.AutomationId))
+                conds.Add(new PropertyCondition(AutomationElement.AutomationIdProperty, spec.AutomationId));
+            if (!string.IsNullOrEmpty(spec.ClassName))
+                conds.Add(new PropertyCondition(AutomationElement.ClassNameProperty, spec.ClassName));
+            if (!string.IsNullOrEmpty(spec.Name) && spec.Exact)
+                conds.Add(new PropertyCondition(AutomationElement.NameProperty, spec.Name));
+            if (!string.IsNullOrEmpty(spec.Type)) {
+                ControlType ct;
+                if (TypeMap.TryGetValue(spec.Type, out ct))
+                    conds.Add(new PropertyCondition(AutomationElement.ControlTypeProperty, ct));
+            }
+
+            if (conds.Count > 0) {
+                Condition cond = conds.Count == 1 ? (Condition)conds[0] : new AndCondition(conds.ToArray());
+                var found = win.FindAll(TreeScope.Descendants, cond);
+                var list = new List<AutomationElement>();
+                foreach (AutomationElement e in found) {
+                    try { if (Matches(e, spec)) list.Add(e); } catch { }
+                }
+                return list;
+            }
+
+            // 只剩「Name 模糊包含」这类 UIA 无法表达的谓词：仍要枚举，
+            // 但用 CacheRequest 把属性一次性取回（否则每个元素 3–4 次 COM 往返，2000 元素就是 6000+ 次调用）。
+            var all = AllDescendants(win);
             var matches = new List<AutomationElement>();
-            var all = win.FindAll(TreeScope.Descendants, Condition.TrueCondition);
             foreach (AutomationElement e in all) {
-                try {
-                    if (Matches(e, spec)) matches.Add(e);
-                } catch { }
+                try { if (MatchesCached(e, spec)) matches.Add(e); } catch { }
             }
             return matches;
+        }
+
+        // 属性级缓存请求：只缓存判断所需字段，AutomationElementMode.Full 保证元素仍可点
+        static readonly CacheRequest Req = BuildCacheRequest();
+        static CacheRequest BuildCacheRequest() {
+            var r = new CacheRequest();
+            r.Add(AutomationElement.NameProperty);
+            r.Add(AutomationElement.AutomationIdProperty);
+            r.Add(AutomationElement.ClassNameProperty);
+            r.Add(AutomationElement.ControlTypeProperty);
+            r.AutomationElementMode = AutomationElementMode.Full;
+            return r;
+        }
+
+        static bool MatchesCached(AutomationElement e, FindSpec spec) {
+            if (!string.IsNullOrEmpty(spec.AutomationId)) {
+                if (e.Cached.AutomationId != spec.AutomationId) return false;
+            }
+            if (!string.IsNullOrEmpty(spec.ClassName)) {
+                if (e.Cached.ClassName != spec.ClassName) return false;
+            }
+            if (!string.IsNullOrEmpty(spec.Type)) {
+                string tn = "Unknown";
+                try { tn = e.Cached.ControlType.ProgrammaticName.Replace("ControlType.", ""); } catch { }
+                if (tn != spec.Type) return false;
+            }
+            if (!string.IsNullOrEmpty(spec.Name)) {
+                string n = e.Cached.Name;
+                if (n == null) return false;
+                if (spec.Exact) { if (n != spec.Name) return false; }
+                else { if (!n.Contains(spec.Name)) return false; }
+            }
+            return true;
+        }
+
+        // ---- 元素枚举短缓存 ----
+        // 只用于"模糊匹配"路径；任何会改变界面的命令都会调 InvalidateAll() 清掉。
+        class CacheEntry { public List<AutomationElement> Elements; public DateTime At; }
+        static readonly Dictionary<long, CacheEntry> _cache = new Dictionary<long, CacheEntry>();
+        const int CacheMs = 400;
+
+        public static void InvalidateAll() { lock (_cache) _cache.Clear(); }
+
+        static List<AutomationElement> AllDescendants(AutomationElement win) {
+            long key = 0;
+            try { key = win.Current.NativeWindowHandle; } catch { }
+            lock (_cache) {
+                CacheEntry ce;
+                if (key != 0 && _cache.TryGetValue(key, out ce)
+                    && (DateTime.Now - ce.At).TotalMilliseconds < CacheMs) return ce.Elements;
+            }
+            var list = new List<AutomationElement>();
+            using (Req.Activate()) {                     // 属性一次性拉回，避免逐元素 COM 往返
+                var all = win.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                foreach (AutomationElement e in all) list.Add(e);
+            }
+            if (key != 0) lock (_cache) _cache[key] = new CacheEntry { Elements = list, At = DateTime.Now };
+            return list;
+        }
+
+        // ControlType 名称 → 对象（TypeName() 的反向映射）。
+        // 注意：ControlType 的成员在不同 .NET 版本里既有 static property 也有 static field，两种都要扫。
+        static readonly Dictionary<string, ControlType> TypeMap = BuildTypeMap();
+        static Dictionary<string, ControlType> BuildTypeMap() {
+            var d = new Dictionary<string, ControlType>(StringComparer.OrdinalIgnoreCase);
+            var t = typeof(ControlType);
+            var flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static;
+            foreach (var p in t.GetProperties(flags)) {
+                if (p.PropertyType != typeof(ControlType)) continue;
+                try { d[p.Name] = (ControlType)p.GetValue(null, null); } catch { }
+            }
+            foreach (var f in t.GetFields(flags)) {
+                if (f.FieldType != typeof(ControlType)) continue;
+                try { d[f.Name] = (ControlType)f.GetValue(null); } catch { }
+            }
+            return d;
         }
 
         static bool Matches(AutomationElement e, FindSpec spec) {
