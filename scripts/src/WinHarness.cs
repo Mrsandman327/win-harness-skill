@@ -1495,6 +1495,7 @@ namespace WinHarness {
                                                                           OCR 文字定位并点击(自绘/弹层兜底)
   trace     [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]      回读轨迹(需 -Trace 开启记录)
   status    [-NoSurfaces]                                                 环境自检(提权/会话/DPI/显示器/OCR/前台/trace)
+  wndat     -X <n> -Y <n>                                                 诊断:该点命中的窗口(含根窗口/进程/类名)
   surfaces                                                                列出 shell 表面(任务栏/桌面/开始/托盘/通知)
   open      -Surface <taskbar|taskbar2|desktop|start|overflow|notifications> [-Timeout 1500]
                                                                           打开 shell 表面并返回 hwnd

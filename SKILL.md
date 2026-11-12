@@ -46,7 +46,7 @@ $W = ".\scripts\win-harness.exe"
 | `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
 | `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd/根窗口/进程/类名） |
 | `status [-NoSurfaces]` | 环境自检：提权/会话/桌面/DPI/显示器/OCR 语言包/前台窗口/trace |
-| `clicktext (-Window <定位> \| -X -Y -Width -Height) -Text <文字> [-Index 0] [-DryRun] [-NoWords]` | **按屏幕上的文字点击**（不依赖 UIA），自绘界面/XAML 弹层/任务栏空树时的兜底 |
+| `clicktext (-Window <定位> \| -X -Y -Width -Height) -Text <文字> [-Index 0] [-DryRun] [-Capture auto\|screen\|window]` | **按屏幕上的文字点击**（不依赖 UIA），自绘界面/XAML 弹层/任务栏空树时的兜底 |
 | `do -Ops <子命令1 ; 子命令2 ; ...>` | 批处理，一次进程执行多步 |
 | `b64 -Text <>` | 文本转 base64（备用） |
 
@@ -302,7 +302,7 @@ Chromium 系应用（Edge / Electron / WebView2 / Tauri）的 UIA 树极浅，�
 | `monitors` / `virtual_screen` | 每台显示器的 bounds 与 DPI（决定 OCR 上采样倍数的来源） |
 | `ocr_languages` | 空数组 = 系统没装 OCR 语言包，`ocr`/`clicktext` 直接不可用 |
 | `foreground` | 当前前台窗口——键盘输入会发到这里 |
-| `surfaces` | shell 表面可用性（`-NoSurfaces` 可跳过，省约 100ms） |
+| `surfaces` | shell 表面可用性（`-NoSurfaces` 可跳过；实测两者只差 <15ms，开关主要为裁剪输出） |
 
 实测输出示例（本机）：`Windows 10 Pro 26H2` / build `26300.9711`、session 7、未提权、`per-monitor-v2`、双屏 2880×1920@150% + 1920×1080@100%、OCR 语言包 `zh-Hans-CN`。
 

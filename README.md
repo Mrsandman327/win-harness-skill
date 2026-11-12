@@ -6,9 +6,9 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 
 > 操作手册（命令参数、排障、工作流）见 [SKILL.md](SKILL.md)。本文件是技术总览：实现原理、功能、能力范围。
 
-- 命令数：**22**
-- 源码：**4 个 C# 文件** / 约 **1800 行**
-- 产物：`scripts/win-harness.exe`（单文件，约 **62 KB**）
+- 命令数：**29**（`help` 列出 27 个主命令，另有诊断命令 `wndat` 与编码辅助 `b64`）
+- 源码：**9 个 C# 文件** / 约 **3570 行**
+- 产物：`scripts/win-harness.exe`（单文件，约 **108 KB**）
 
 ---
 
@@ -393,7 +393,7 @@ UIA 自动化的失败原因高度集中：没提权、目标在别的会话、�
 | Trace / 错误码 | 通过：`do` 三步第 2 步失败 → 3 条 NDJSON 带 `step/of/code/retry`；`-Stats` 聚合正确 |
 | shell 表面 | 通过：`taskbar`（27–28 元素）、`taskbar2`、`desktop`、`overflow` 可寻址；`start` / `notifications` 可打开但无可寻址窗口（`addressing:"none"`），用 `clicktext` 操作，已实测点开计算器 |
 | 查找性能（Chromium 窗口 2000+ 元素） | 通过：`-AutomationId` 2000→400ms，`-Name -Exact` 2000→390ms，`-Type` 2100→650ms，模糊 `-Name` 1600ms |
-| 回归套件（22 项，`wh-regress.ps1`） | 22/22 通过（微信窗口不可见时跳过该项） |
+| 回归套件（23 项，`scripts/regress.ps1`） | 23/23 通过（微信窗口不可见、任务栏 provider 空树时对应项标记为 skip） |
 
 ---
 
@@ -416,6 +416,7 @@ win-harness/
         ├── Occlusion.cs        遮挡检测（网格采样 / 同应用排除）与 -Raise
         ├── ShellSurface.cs     shell 表面定位（taskbar / desktop / start / overflow）
         ├── Codes.cs            错误码 / retry 语义 / NDJSON 轨迹日志
+        ├── Status.cs           环境自检（提权 / 会话 / DPI / 显示器 / OCR 语言包）
         └── WinHarness.cs       CLI 主程序 + 命令分发 + 批处理 + MiniJson
 ```
 
