@@ -45,6 +45,7 @@ $W = ".\scripts\win-harness.exe"
 | `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd（之后用 `-Window shell:<名字>` 操作） |
 | `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
 | `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd/根窗口/进程/类名） |
+| `clicktext (-Window <定位> \| -X -Y -Width -Height) -Text <文字> [-Index 0] [-DryRun] [-NoWords]` | **按屏幕上的文字点击**（不依赖 UIA），自绘界面/XAML 弹层/任务栏空树时的兜底 |
 | `do -Ops <子命令1 ; 子命令2 ; ...>` | 批处理，一次进程执行多步 |
 | `b64 -Text <>` | 文本转 base64（备用） |
 
@@ -267,7 +268,28 @@ Chromium 系应用（Edge / Electron / WebView2 / Tauri）的 UIA 树极浅，�
 1. **任务栏 UIA 树会间歇性返回 0 个元素**（同一 hwnd 先 27 个、稍后 0 个，按一次 `ESC` 后又恢复——通常是开始菜单/弹出层残留把树压制了）。`tree -Window shell:*` 已内置 3 次重试；仍为空时 `backend` 会标 `uia(empty-after-retry)`，此时改用 `screenshot` + `ocr` 兜底。
 2. **开始菜单在 Win11 是 `Wnd_StartFeed`**，不再是老的 `Windows.UI.Core.CoreWindow`（同标题的 CoreWindow 实测是「设置」）。另外本机 **`SendInput` 发 `VK_LWIN` 不弹开始菜单**，所以 `open -Surface start` 改为先点任务栏的开始按钮，再退回 WIN 键。若两条都失败会明确报错，不会静默。
 
+## 按文字点击（`clicktext`）
+
+当**元素树里根本没有目标**时用这个：自绘界面、XAML 弹层、任务栏 UIA 抽风、以及那些只有截图才有意义的界面。它把 OCR 结果直接变成可点坐标，不经过 UIA。
+
+```powershell
+& $W clicktext -Window "Navicat" -Text "我的连接" -DryRun     # 先看命中哪几处
+& $W clicktext -Window "Navicat" -Text "我的连接" -Index 0     # 再真点
+& $W clicktext -X 440 -Y 260 -Width 1100 -Height 1520 -Text "计算器"   # 只在该区域找（弹层/开始菜单）
+```
+
+返回 `matches[]`（全部命中，含坐标）与 `picked` / `point` / `clicked`。**先用 `-DryRun` 确认再点**，因为 OCR 是模糊匹配：
+
+- 匹配规则：归一化去空白后「OCR 行包含查询」或「查询包含 OCR 行（行需 ≥2 字）」
+- 命中多处时用 `-Index` 选；不指定默认第 0 个
+- 区域模式（`-X -Y -Width -Height`）不需要 `-Window`，弹层 OCR 比全窗快一个量级
+
+**实测**：Win11 开始菜单的 UIA 窗口在本机无法定位（点击能打开，但 `Wnd_StartFeed` 始终不可见、`WindowFromPoint` 也命中不到它），改用 `clicktext -X ... -Text "计算器"` → 命中 `(1342,801) 计 算 器` 并成功点击、拉起了计算器。这就是"缺口用另一条通道绕过去"的典型做法。
+
+代价：OCR 有误识（小字经常错 1–2 个汉字），所以**关键操作要配 `-DryRun` + 结果校验**；不要用它在聊天窗口里点"发送"这类不可逆按钮。
+
 ## 轨迹与错误码（长流程排障）
+
 
 加 `-Trace`（或环境变量 `WIN_HARNESS_TRACE=1`）后，每次调用写一行 NDJSON：
 

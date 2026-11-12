@@ -1,8 +1,10 @@
-# 回归测试（无副作用）：只读检查，不改窗口状态、不发破坏性输入
+﻿# 回归测试（无副作用）：只读检查，不改窗口状态、不发破坏性输入
 # 用法: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\regress.ps1
+# 注意：脚本内不要写中文字符串字面量（PowerShell 5.1 在无 BOM 时按 ANSI 解析会截断引号），
+#       需要中文时用 -TextB64 / -NameB64。
 $ErrorActionPreference = 'Continue'
 $W = Join-Path $PSScriptRoot 'win-harness.exe'
-if (-not (Test-Path $W)) { throw "找不到 $W" }
+if (-not (Test-Path $W)) { throw "missing $W" }
 $T = Join-Path $env:TEMP ("wh-reg-" + [guid]::NewGuid().ToString("N").Substring(0, 6))
 New-Item -ItemType Directory -Force -Path $T | Out-Null
 
@@ -23,7 +25,7 @@ $r = J @('screenshot', '-Monitor', '1', '-Out', "$T\m1.png")
 Check 'screenshot -Monitor' ($r.ok -and (Test-Path "$T\m1.png")) "$($r.data.w)x$($r.data.h)"
 $b = (& $W b64 -Text 'abc' 2>&1 | Out-String).Trim(); Check 'b64' ($b -eq 'YWJj') $b
 
-# --- 目标窗口（优先计算器：WinUI，结构稳定） ---
+# --- 目标窗口（计算器：WinUI，结构稳定）---
 $calc = (J @('windows')).data | Where-Object { $_.proc -match 'ApplicationFrameHost|CalculatorApp' } | Select-Object -First 1
 if ($calc) {
     $H = "hwnd:$($calc.hwnd)"
@@ -33,12 +35,17 @@ if ($calc) {
     $r = J @('getprop', '-Window', $H, '-AutomationId', 'num7Button'); Check 'getprop' $r.ok 'ok'
     $r = J @('screenshot', '-Window', $H, '-Capture', 'window', '-Out', "$T\calc.png")
     Check 'screenshot window' ($r.ok -and $r.data.capture -eq 'window' -and $null -ne $r.data.occluded) "capture=$($r.data.capture) occ=$($r.data.occluded)"
-    $r = J @('ocr', '-Window', $H, '-NoWords');               Check 'ocr -NoWords' ($r.ok -and ($null -eq $r.data.lines[0].words)) "lines=$($r.data.lines.Count)"
+    $r = J @('ocr', '-Window', $H, '-NoWords')
+    Check 'ocr -NoWords' ($r.ok -and ($null -eq $r.data.lines[0].words)) "lines=$($r.data.lines.Count)"
+    # base64 of the window title (Chinese) to avoid script-encoding pitfalls
+    $titleB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('计算器'))
+    $r = J @('clicktext', '-Window', $H, '-TextB64', $titleB64, '-DryRun')
+    Check 'clicktext dry-run' ($r.ok -and $r.data.matches.Count -ge 1) "matches=$($r.data.matches.Count) capture=$($r.data.capture)"
     $r = J @('screenshot', '-Window', $H, '-Capture', 'screen', '-Out', "$T\occ.png")
     Check 'occlusion fields' ($r.ok -and $null -ne $r.data.occluded) "occ=$($r.data.occluded) samples=$($r.data.covered_samples)"
-} else { Check 'calc window' $false 'not running - skipped' }
+} else { Check 'calc window' $false 'not running' }
 
-# --- 微信（自绘，只读） ---
+# --- 微信（自绘，只读）---
 $wx = (J @('windows')).data | Where-Object { $_.proc -match 'Weixin' -and $_.w -gt 500 } | Select-Object -First 1
 if ($wx) {
     $r = J @('ocr', '-Window', "hwnd:$($wx.hwnd)", '-Capture', 'window')
@@ -72,5 +79,5 @@ $pass = ($results | Where-Object pass).Count
 ""
 $results | ForEach-Object { "{0}  {1,-26} {2}" -f ($(if ($_.pass) { 'PASS' } else { 'FAIL' })), $_.test, $_.detail }
 ""
-"总计: $pass / $($results.Count)"
-"临时目录: $T"
+"TOTAL: $pass / $($results.Count)"
+"tmp: $T"

@@ -103,6 +103,7 @@ namespace WinHarness {
                 case "surfaces": return CmdSurfaces(opts);
                 case "wndat": return CmdWndAt(opts);
                 case "open": return CmdOpen(opts);
+                case "clicktext": return CmdClickText(opts);
                 case "do": return CmdDo(opts);
                 default: throw new Exception("未知命令: " + cmd + "（运行 win-harness.exe help 查看用法）");
             }
@@ -987,6 +988,112 @@ namespace WinHarness {
             return ScreenCap.Capture(rect, -1, outPath);
         }
 
+        // clicktext：按 OCR 识别到的文字点击（自绘 UI / XAML 弹层 / 任务栏空树时的通用兜底）
+        // 与 click -Name 的区别：不依赖 UIA 元素，直接把"屏幕上看到的字"变成可点目标。
+        static object CmdClickText(Dictionary<string, string> o) {
+            string text = GetText(o, "Text", "TextB64");
+            if (string.IsNullOrEmpty(text)) throw new WhException(ErrorCodes.BadArgs, "never", "需要 -Text（要点击的文字）");
+
+            long hwnd = 0;
+            Native.RECT rect;
+            bool hasRegion = o.ContainsKey("X") || o.ContainsKey("Y") || o.ContainsKey("Width") || o.ContainsKey("Height");
+
+            if (hasRegion) {
+                // 只在该区域内找：不受窗口边界限制，配合弹层/局部区域使用更快
+                if (!(o.ContainsKey("X") && o.ContainsKey("Y") && o.ContainsKey("Width") && o.ContainsKey("Height")))
+                    throw new WhException(ErrorCodes.BadArgs, "never", "区域 OCR 需要 -X -Y -Width -Height 同时提供");
+                int ax = RequireInt(o, "X", "屏幕 X，可为负数"), ay = RequireInt(o, "Y", "屏幕 Y，可为负数");
+                int aw = RequireInt(o, "Width", "宽度"), ah = RequireInt(o, "Height", "高度");
+                rect = new Native.RECT { Left = ax, Top = ay, Right = ax + aw, Bottom = ay + ah };
+            } else {
+                var win = ResolveWin(o);
+                hwnd = win.Current.NativeWindowHandle;
+                if (hwnd == 0) throw new WhException(ErrorCodes.NotFound, "reprobe", "无法解析目标窗口");
+                var b = win.Current.BoundingRectangle;
+                int x = Uia.F(b.X), y = Uia.F(b.Y), w = Uia.F(b.Width), h = Uia.F(b.Height);
+                if (w <= 0 || h <= 0) {
+                    Native.GetWindowRect(new IntPtr(hwnd), out rect);
+                } else {
+                    rect = new Native.RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
+                }
+            }
+
+            var occ = Occlusion.Measure(new IntPtr(hwnd), rect);
+            string mode;
+            var cap = Grab(hwnd, rect, Opt(o, "Capture"), occ == null ? 0.0 : (double)occ["occluded"], null, out mode);
+            int rx = Convert.ToInt32(cap["x"]), ry = Convert.ToInt32(cap["y"]);
+            string png = (string)cap["path"];
+
+            Dictionary<string, object> ocr;
+            try {
+                double dpi = Native.DpiOfWindow(new IntPtr(hwnd));
+                int upscale = o.ContainsKey("Upscale") ? RequireInt(o, "Upscale", "上采样倍数") : (dpi >= 120.0 ? 1 : 2);
+                ocr = OcrRunner.Recognize(png, Opt(o, "Lang", "zh-Hans"), upscale);
+            } finally {
+                try { File.Delete(png); } catch { }
+            }
+
+            // 归一化：去掉所有空白后再比较，绕开中文被拆成单字的问题
+            string want = Normalize(text);
+            var hits = new List<Dictionary<string, object>>();
+            foreach (var l in (List<Dictionary<string, object>>)ocr["lines"]) {
+                string lt = Normalize((string)l["text"]);
+                if (lt.Length == 0) continue;
+                // 反向包含（ocr 行比查询更短）只在行本身有 2 个字符以上时才算，
+                // 否则单字碎片（"e"、"0"）会把几乎所有查询都匹配上
+                if (lt.Contains(want) || (want.Length >= 4 && lt.Length >= 2 && want.Contains(lt))) {
+                    var d = new Dictionary<string, object>();
+                    d["text"] = l["text"];
+                    d["x"] = Convert.ToInt32(l["x"]) + rx;
+                    d["y"] = Convert.ToInt32(l["y"]) + ry;
+                    d["w"] = l["w"]; d["h"] = l["h"];
+                    hits.Add(d);
+                }
+            }
+
+            var res = new Dictionary<string, object>();
+            res["query"] = text;
+            res["engine"] = ocr["engine"];
+            res["capture"] = mode;
+            if (occ != null && occ.ContainsKey("occluded")) res["occluded"] = occ["occluded"];
+            res["matches"] = hits;
+
+            if (hits.Count == 0) {
+                res["code"] = "TEXT_NOT_FOUND";
+                res["warning"] = "OCR 未找到该文字；可先 screenshot 核对，或放宽 -Text / 改用 -Index 定位";
+                return res;
+            }
+
+            int idx = OptInt(o, "Index", 0);
+            if (idx < 0 || idx >= hits.Count) {
+                res["code"] = "BAD_ARGS";
+                res["warning"] = "-Index 越界（匹配数 " + hits.Count + "）";
+                return res;
+            }
+            var pick = hits[idx];
+            int cx = Convert.ToInt32(pick["x"]) + Convert.ToInt32(pick["w"]) / 2;
+            int cy = Convert.ToInt32(pick["y"]) + Convert.ToInt32(pick["h"]) / 2;
+            res["picked"] = pick;
+            res["point"] = new Dictionary<string, object> { { "x", cx }, { "y", cy } };
+
+            if (Flag(o, "DryRun")) { res["clicked"] = false; return res; }
+
+            InputSim.MoveTo(cx, cy);
+            System.Threading.Thread.Sleep(40);
+            Native.mouse_event(Native.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            System.Threading.Thread.Sleep(30);
+            Native.mouse_event(Native.MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+            res["clicked"] = true;
+            return res;
+        }
+
+        static string Normalize(string s) {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s) if (!char.IsWhiteSpace(c)) sb.Append(c);
+            return sb.ToString();
+        }
+
         // ocr：截取窗口 / 指定矩形做 OCR，文本坐标换算回屏幕绝对坐标
         static object CmdOcr(Dictionary<string, string> o) {
             bool hasAny = o.ContainsKey("X") || o.ContainsKey("Y") || o.ContainsKey("Width") || o.ContainsKey("Height");
@@ -1360,6 +1467,8 @@ namespace WinHarness {
   getprop   -Window <定位> [-Name <>|-AutomationId <>] [-Index n]   读元素属性与支持的 Pattern
   pixel     -X <n> -Y <n>                                 取屏幕像素颜色(视觉验证)
   ocr       [-Window <定位> | -X -Y -Width -Height] [-Upscale auto|n] [-Lang zh-Hans] [-Out <路径>]
+  clicktext -Window <定位> -Text <文字> [-Index 0] [-DryRun] [-Capture auto|screen|window]
+                                                                          OCR 文字定位并点击(自绘/弹层兜底)
   trace     [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]      回读轨迹(需 -Trace 开启记录)
   surfaces                                                                列出 shell 表面(任务栏/桌面/开始/托盘/通知)
   open      -Surface <taskbar|taskbar2|desktop|start|overflow|notifications> [-Timeout 1500]

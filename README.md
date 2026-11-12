@@ -191,7 +191,27 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 
 `do` 批处理的收益同样来自这里：5 次独立调用 330ms，合成一条 `do` 只需 130ms（省掉 4 次进程启动 + 4 次 UIA 初始化）。
 
+### 1.13 按文字点击（`clicktext`）与"绕过去"的思路
+
+有些目标**根本进不了元素树**：自绘界面、XAML 弹层、任务栏 UIA 抽风时。与其继续在 UIA 上打补丁，不如换一条通道——`clicktext` 直接拿 OCR 结果当可点坐标。
+
+实测（Win11 开始菜单）：点击任务栏的开始按钮能打开菜单，但 `Wnd_StartFeed` 始终不可见、`WindowFromPoint` 也命中不到菜单窗口，因此**拿不到 hwnd**，`tree -Window shell:start` 这条路在本机走不通。改用：
+
+```powershell
+clicktext -X 440 -Y 260 -Width 1100 -Height 1520 -Text "计算器"
+```
+
+命中 `(1342,801) 计 算 器` 并成功点击、拉起计算器。
+
+设计取舍：
+
+- **不做"猜坐标"**：只在 OCR 结果里找字，找不到就返回 `TEXT_NOT_FOUND`，绝不退化成点屏幕中心
+- **必须支持 `-DryRun`**：OCR 有误识（小字常错 1–2 个汉字），不可逆操作要先看 `matches` 再点
+- **模糊匹配有边界**：归一化去空白后「行包含查询」或「查询包含行（行 ≥2 字）」，避免单字碎片匹配一切
+- **区域模式**（`-X -Y -Width -Height`）比全窗快一个量级，弹层场景务必用
+
 ## 二、功能
+
 
 
 
@@ -236,6 +256,7 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 | `surfaces` | 列出 shell 表面（taskbar / taskbar2 / desktop / start / overflow / notifications） |
 | `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd |
 | `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd / 根窗口 / 进程 / 类名） |
+| `clicktext (-Window <定位> \| -X -Y -Width -Height) -Text <文字> [-Index 0] [-DryRun]` | 按屏幕上的文字点击（OCR 定位，不依赖 UIA） |
 | `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
 | `clipboard [-Get] \| [-Set -Text]` | 读 / 写剪贴板 |
 | `wait -Window <定位> -Name <> [-Timeout 10] [-Gone]` | 等待元素出现 / 消失 |
