@@ -57,7 +57,7 @@ $refArgs = $refs | ForEach-Object { "/r:$_" }
 # 先删旧产物：编译失败时不会留下"看似成功"的过期 exe
 if (Test-Path $out) { Remove-Item $out -Force }
 
-& $csc /nologo /target:exe /out:$out @refArgs "$src\Native.cs" "$src\Uia.cs" "$src\InputSim.cs" "$src\Ocr.cs" "$src\WinHarness.cs"
+& $csc /nologo /target:exe /out:$out @refArgs "$src\Native.cs" "$src\Uia.cs" "$src\InputSim.cs" "$src\Ocr.cs" "$src\Occlusion.cs" "$src\ShellSurface.cs" "$src\Codes.cs" "$src\WinHarness.cs"
 if ($LASTEXITCODE -ne 0) { throw "编译失败（csc 退出码 $LASTEXITCODE）" }
 if (-not (Test-Path $out)) { throw "编译失败：未生成 $out" }
 Write-Output "编译成功: $out"

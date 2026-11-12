@@ -100,6 +100,50 @@ namespace WinHarness {
             } catch { }
         }
 
+        // ---- 遮挡检测（Occlusion.cs）----
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+        [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+        public const uint GA_ROOT = 2;
+        [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+        [DllImport("user32.dll")] public static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+        // ---- shell 表面定位 ----
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        // ---- 监视器 DPI（ocr 自适应上采样用）----
+        // 高 DPI 屏上系统已按缩放比渲染文字（150% 屏 12px 字实际 18px），
+        // 再不识别地放大 2 倍只会把字糊掉、并让耗时线性增长。
+        [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr MonitorFromRect(ref RECT r, uint flags);
+        [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmon, int dpiType, out uint dpiX, out uint dpiY);
+        public const uint MONITOR_DEFAULTTONEAREST = 0x0002;
+
+        // 窗口自身 DPI；老系统缺 GetDpiForWindow 时回退到所在监视器
+        public static double DpiOfWindow(IntPtr hWnd) {
+            try {
+                uint d = GetDpiForWindow(hWnd);
+                if (d > 0) return d;
+            } catch { }
+            RECT r;
+            if (GetWindowRect(hWnd, out r)) return DpiOfRect(r);
+            return 96.0;
+        }
+
+        // 矩形中心所在监视器的有效 DPI；任何一步失败都退回 96（100%）
+        public static double DpiOfRect(RECT r) {
+            try {
+                var mon = MonitorFromRect(ref r, MONITOR_DEFAULTTONEAREST);
+                uint dx, dy;
+                if (GetDpiForMonitor(mon, 0, out dx, out dy) == 0 && dx > 0) return dx;
+            } catch { }
+            return 96.0;
+        }
+
         // ---- MSAA(IAccessible) 回退通道 ----
         // 用途：Chromium/Electron/WebView2 的 UIA 树极浅（实测 6-13 个元素），
         // 因为它们对"无条件全树遍历"不激活渲染进程的无障碍树；

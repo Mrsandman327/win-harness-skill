@@ -15,6 +15,9 @@ using System.Windows.Automation;
 
 namespace WinHarness {
     class Program {
+        static Dictionary<string, string> _opts;   // 供 catch 写 trace（失败时也要记录参数）
+        static Stopwatch _sw;
+
         [STAThread] // 剪贴板操作要求 STA
         static int Main(string[] args) {
             try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
@@ -26,6 +29,9 @@ namespace WinHarness {
                 if (cmd == "help" || cmd == "--help" || cmd == "-h") return PrintHelp();
 
             var opts = ParseArgs(args, 1);
+            _opts = opts;
+            _sw = Stopwatch.StartNew();
+            TraceLog.Init(opts);
 
             if (cmd == "b64") {
                 Console.WriteLine(B64.Encode(GetText(opts)));
@@ -33,6 +39,8 @@ namespace WinHarness {
             }
 
                 object data = Dispatch(cmd, opts);
+                _sw.Stop();
+                TraceLog.Write(cmd, opts, true, _sw.ElapsedMilliseconds, null, null, null, 0, 0, TraceLog.ExtraFrom(data));
 
                 var result = new Dictionary<string, object>();
                 result["ok"] = true;
@@ -40,9 +48,16 @@ namespace WinHarness {
                 Console.WriteLine(MiniJson.Serialize(result));
                 return 0;
             } catch (Exception ex) {
+                string code, retry;
+                ErrorCodes.Classify(ex, out code, out retry);
+                TraceLog.Write(args.Length > 0 ? args[0].ToLowerInvariant() : "?", _opts, false,
+                    _sw == null ? 0 : _sw.ElapsedMilliseconds, code, retry, ex.Message, 0, 0, null);
+
                 var result = new Dictionary<string, object>();
                 result["ok"] = false;
                 result["error"] = ex.Message;
+                result["code"] = code;
+                result["retry"] = retry;
                 result["error_type"] = ex.GetType().Name;
                 result["hresult"] = "0x" + ((uint)ex.HResult).ToString("X8");
                 var w32 = ex as System.ComponentModel.Win32Exception;
@@ -76,6 +91,10 @@ namespace WinHarness {
                 case "getprop": return CmdGetProp(opts);
                 case "pixel": return CmdPixel(opts);
                 case "ocr": return CmdOcr(opts);
+                case "trace": return CmdTrace(opts);
+                case "surfaces": return CmdSurfaces(opts);
+                case "wndat": return CmdWndAt(opts);
+                case "open": return CmdOpen(opts);
                 case "do": return CmdDo(opts);
                 default: throw new Exception("未知命令: " + cmd + "（运行 win-harness.exe help 查看用法）");
             }
@@ -218,9 +237,24 @@ namespace WinHarness {
             } else {
                 elements = Uia.GetTree(win, depth, filter, max);
                 used = "uia";
+
+                // shell 表面的 UIA provider 会间歇性返回空树（实测任务栏：同一 hwnd 先 27 个元素，
+                // 稍后 0 个，发一次 ESC 后恢复）。对这类目标短暂重试，避免把 provider 抽风当成"没有控件"。
+                string ws0 = Opt(o, "Window") ?? "";
+                if (elements.Count == 0 && ws0.StartsWith("shell:", StringComparison.OrdinalIgnoreCase)) {
+                    for (int attempt = 0; attempt < 3 && elements.Count == 0; attempt++) {
+                        Thread.Sleep(250);
+                        try {
+                            var w2 = ResolveWin(o);
+                            elements = Uia.GetTree(w2, depth, filter, max);
+                        } catch { }
+                    }
+                    if (elements.Count == 0) used = "uia(empty-after-retry)";
+                }
+
                 // auto：UIA 树过浅时（Chromium 系典型只有个位数元素）自动试 MSAA，取元素更多者。
                 // 阈值 15 来自实测：Win32/WinUI/Qt 均 >40，而 Chromium/Electron/WebView2 仅 6-13。
-                if (backend == "auto" && elements.Count < 15) {
+                if (elements.Count < 15) {
                     var msaa = Uia.MsaaTree(new IntPtr(hwnd), depth, max);
                     if (msaa.Count > elements.Count) {
                         elements = msaa;
@@ -452,10 +486,31 @@ namespace WinHarness {
             string warning = null;
             if (!string.IsNullOrEmpty(winSpec)) {
                 var win = ResolveWin(o);
+                var hwnd = new IntPtr(win.Current.NativeWindowHandle);
                 Native.RECT r;
-                Native.GetWindowRect(new IntPtr(win.Current.NativeWindowHandle), out r);
+                Native.GetWindowRect(hwnd, out r);
                 warning = RectMismatchWarning(win, r);
-                res = ScreenCap.Capture(r, -1, outPath);
+
+                // 遮挡检测：CopyFromScreen 抓屏幕像素，被盖住会静默截到别人的窗口
+                var occ = Occlusion.Measure(hwnd, r);
+                if (occ != null && Flag(o, "Raise") && (double)occ["occluded"] > 0.0) {
+                    Occlusion.Raise(hwnd);
+                    Native.GetWindowRect(hwnd, out r);
+                    occ = Occlusion.Measure(hwnd, r);
+                    occ["raised"] = true;
+                }
+                string captureMode;
+                res = Grab(hwnd.ToInt64(), r, Opt(o, "Capture"),
+                           occ == null ? 0.0 : (double)occ["occluded"], outPath, out captureMode);
+                res["capture"] = captureMode;
+                if (occ != null) {
+                    foreach (var kv in occ) res[kv.Key] = kv.Value;
+                    double occluded = (double)occ["occluded"];
+                    if (occluded > 0.05) {
+                        string occl = "目标有 " + Math.Round(occluded * 100) + "% 面积被其他窗口覆盖，截到的是遮挡者的内容";
+                        res["warning"] = warning == null ? occl : warning + "；" + occl;
+                    }
+                }
             } else {
                 res = ScreenCap.Capture(null, monitor, outPath);
             }
@@ -899,10 +954,36 @@ namespace WinHarness {
             }
         }
 
+        // 统一取图入口：-Capture auto|screen|window
+        //   auto   = 未被遮挡走屏幕截图；被遮挡优先取窗口自身内容（PrintWindow），失败自动回退并标注
+        //   screen = 强制屏幕像素（与旧行为一致）
+        //   window = 强制 PrintWindow，失败回退屏幕并标 screen(fallback)
+        // 回退时必须把 usedRect 复原成原区域，否则 OCR 的坐标换算会整体偏移。
+        static Dictionary<string, object> Grab(long hwnd, Native.RECT rect, string mode, double occluded,
+                                               string outPath, out string used) {
+            string m = string.IsNullOrEmpty(mode) ? "auto" : mode.ToLowerInvariant();
+            if (m != "auto" && m != "screen" && m != "window")
+                throw new WhException(ErrorCodes.BadArgs, "never", "-Capture 只能是 auto / screen / window");
+
+            bool tryWindow = (m == "window") || (m == "auto" && hwnd != 0 && occluded > 0.05);
+            if (tryWindow && hwnd != 0) {
+                Native.RECT wr;
+                var grabRect = rect;
+                if (Native.GetWindowRect(new IntPtr(hwnd), out wr) && wr.Right > wr.Left && wr.Bottom > wr.Top) grabRect = wr;
+                var r = ScreenCap.CaptureWindow(new IntPtr(hwnd), grabRect, outPath);
+                if (r != null) { used = "window"; return r; }
+                used = "screen(fallback)";
+                return ScreenCap.Capture(rect, -1, outPath);
+            }
+            used = "screen";
+            return ScreenCap.Capture(rect, -1, outPath);
+        }
+
         // ocr：截取窗口 / 指定矩形做 OCR，文本坐标换算回屏幕绝对坐标
         static object CmdOcr(Dictionary<string, string> o) {
             bool hasAny = o.ContainsKey("X") || o.ContainsKey("Y") || o.ContainsKey("Width") || o.ContainsKey("Height");
             Native.RECT rect;
+            long ocrHwnd = 0;
             if (hasAny) {
                 if (!(o.ContainsKey("X") && o.ContainsKey("Y") && o.ContainsKey("Width") && o.ContainsKey("Height")))
                     throw new Exception("坐标不完整：-X -Y -Width -Height 必须同时提供（或都不给，改用 -Window）");
@@ -913,23 +994,60 @@ namespace WinHarness {
                 rect = new Native.RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
             } else {
                 var win = ResolveWin(o);
-                long hwnd = win.Current.NativeWindowHandle;
+                ocrHwnd = win.Current.NativeWindowHandle;
                 var b = win.Current.BoundingRectangle;
                 int x = Uia.F(b.X), y = Uia.F(b.Y), w = Uia.F(b.Width), h = Uia.F(b.Height);
                 if (w <= 0 || h <= 0) {                                   // UIA 矩形无效时退回 Win32
                     Native.RECT wr;
-                    Native.GetWindowRect(new IntPtr(hwnd), out wr);
+                    Native.GetWindowRect(new IntPtr(ocrHwnd), out wr);
                     x = wr.Left; y = wr.Top; w = wr.Right - wr.Left; h = wr.Bottom - wr.Top;
                 }
                 rect = new Native.RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
+
+                // 最小化/隐藏窗口必须显式报错：CopyFromScreen 只能抓屏幕像素，
+                // 以前会静默返回 lines:[] 且 ok:true，调用方误判“这里没有文字”。
+                if (Native.IsIconic(new IntPtr(ocrHwnd)))
+                    throw new Exception("窗口已最小化，OCR 抓的是屏幕像素、读不到内容；请先 focus -Window <定位> 还原窗口再 OCR");
+                if (rect.Left <= -20000 || rect.Top <= -20000)
+                    throw new Exception("窗口被隐藏或最小化到屏幕外（rect=" + rect.Left + "," + rect.Top
+                        + "），OCR 无法读取；请先 focus -Window <定位> 还原窗口");
             }
 
-            int upscale = OptInt(o, "Upscale", 2);
+            // -Upscale 默认 auto：按所在监视器 DPI 自适应。
+            // 高 DPI 屏系统已按缩放比渲染文字（150% 屏 12px 字实际 18px），再放大 2 倍只会糊掉小字、
+            // 耗时线性增长。实测 150% 屏 2902x1870 窗口：upscale=1 → 1.07s/156 行、命中 10/11；
+            // upscale=2 → 1.89s/145 行、命中 9/11，且局部小字区域直接返回 0 行。
+            int upscale;
+            string upscaleMode;
+            if (o.ContainsKey("Upscale")) {
+                upscale = RequireInt(o, "Upscale", "上采样倍数（>=1，默认按监视器 DPI 自动选择）");
+                upscaleMode = "explicit";
+            } else {
+                double dpi = ocrHwnd != 0
+                    ? Native.DpiOfWindow(new IntPtr(ocrHwnd))
+                    : Native.DpiOfRect(rect);
+                upscale = dpi >= 120.0 ? 1 : 2;
+                upscaleMode = "auto(dpi=" + ((int)Math.Round(dpi)) + ")";
+            }
             if (upscale < 1) upscale = 1;
             string lang = Opt(o, "Lang", "zh-Hans");
             string outPath = Opt(o, "Out");
 
-            var cap = ScreenCap.Capture(rect, -1, outPath);               // {path,x,y,w,h}
+            // 遮挡检测：被盖住时 CopyFromScreen 读到的是遮挡者的内容，识别结果会张冠李戴
+            Dictionary<string, object> occ = null;
+            if (ocrHwnd != 0) {
+                occ = Occlusion.Measure(new IntPtr(ocrHwnd), rect);
+                if (occ != null && Flag(o, "Raise") && (double)occ["occluded"] > 0.0) {
+                    Occlusion.Raise(new IntPtr(ocrHwnd));
+                    Native.RECT wr;
+                    if (Native.GetWindowRect(new IntPtr(ocrHwnd), out wr)) rect = wr;
+                    occ = Occlusion.Measure(new IntPtr(ocrHwnd), rect);
+                    occ["raised"] = true;
+                }
+            }
+
+            string captureMode;
+            var cap = Grab(ocrHwnd, rect, Opt(o, "Capture"), occ == null ? 0.0 : (double)occ["occluded"], outPath, out captureMode);               // {path,x,y,w,h}
             int rx = Convert.ToInt32(cap["x"]), ry = Convert.ToInt32(cap["y"]);
             string png = (string)cap["path"];
 
@@ -960,10 +1078,36 @@ namespace WinHarness {
 
             var res = new Dictionary<string, object>();
             res["engine"] = ocr["engine"];
+            res["requested_lang"] = lang;
+            // 请求语言不可用时会静默退回「用户配置语言」，必须让调用方看见，否则 -Lang 形同虚设
+            if (ocr.ContainsKey("lang_fallback") && (bool)ocr["lang_fallback"]) {
+                res["engine_fallback"] = true;
+                res["warning_lang"] = "请求的 OCR 语言 " + lang + " 不可用，已退回系统用户语言并实际使用 "
+                    + (string)ocr["engine"] + "；如需该语言请先在系统安装对应 OCR 语言包";
+            }
+            res["upscale"] = upscale;
+            res["upscale_mode"] = upscaleMode;
+            res["capture"] = captureMode;
             res["region"] = new Dictionary<string, object> {
                 { "x", rx }, { "y", ry }, { "w", Convert.ToInt32(cap["w"]) }, { "h", Convert.ToInt32(cap["h"]) }
             };
             res["lines"] = lines;
+            if (occ != null) {
+                foreach (var kv in occ) res[kv.Key] = kv.Value;
+                double occluded = (double)occ["occluded"];
+                if (occluded > 0.05) {
+                    // 遮挡是 OCR 最常见的"结果离谱"原因，成功响应里也必须报出来
+                    res["warning"] = "目标有 " + Math.Round(occluded * 100) + "% 面积被其他窗口覆盖，"
+                        + "识别到的文字可能来自遮挡者；先 focus 或加 -Raise 再试";
+                }
+            }
+            if (lines.Count == 0) {
+                // 空结果必须可判定：以前 ok:true + 空数组，调用方只会得出“这里没字”
+                res["code"] = "EMPTY_OCR";
+                res["warning"] = "未识别到任何文本。常见原因：① 目标窗口被其他窗口遮挡（OCR 抓的是屏幕像素，"
+                    + "读到的可能是别人的内容）；② 高 DPI 屏上 -Upscale 过大（默认 auto 已按 DPI 选择，"
+                    + "手动指定时优先试 1）；③ 该区域确实无文字。请先 screenshot 人工核对后再重试。";
+            }
             return res;
         }
 
@@ -982,10 +1126,10 @@ namespace WinHarness {
             if (string.IsNullOrEmpty(ops)) throw new Exception("需要 -Ops（多个子命令用 ; 分隔）");
 
             var steps = new List<Dictionary<string, object>>();
-            foreach (string raw in ops.Split(';')) {
-                string seg = raw.Trim();
-                if (seg.Length == 0) continue;
-
+            var all = ops.Split(';').Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+            int stepNo = 0;
+            foreach (string seg in all) {
+                stepNo++;
                 string[] parts = Tokenize(seg);
                 if (parts.Length == 0) continue;
                 string sub = parts[0].ToLowerInvariant();
@@ -993,15 +1137,33 @@ namespace WinHarness {
 
                 var step = new Dictionary<string, object>();
                 step["op"] = seg;
+                var swStep = Stopwatch.StartNew();
                 try {
                     step["ok"] = true;
                     step["data"] = Dispatch(sub, subOpts);
+                    swStep.Stop();
+                    step["ms"] = swStep.ElapsedMilliseconds;
+                    TraceLog.Write(sub, subOpts, true, swStep.ElapsedMilliseconds, null, null, null,
+                                   stepNo, all.Count, TraceLog.ExtraFrom(step["data"]));
                     steps.Add(step);
                 } catch (Exception ex) {
+                    swStep.Stop();
+                    string code, retry;
+                    ErrorCodes.Classify(ex, out code, out retry);
                     step["ok"] = false;
                     step["error"] = ex.Message;
+                    step["code"] = code;
+                    step["retry"] = retry;
+                    step["ms"] = swStep.ElapsedMilliseconds;
+                    TraceLog.Write(sub, subOpts, false, swStep.ElapsedMilliseconds, code, retry, ex.Message,
+                                   stepNo, all.Count, null);
                     steps.Add(step);
-                    throw new Exception(string.Format("批处理第 {0} 步失败: {1} — {2}", steps.Count, seg, ex.Message));
+
+                    var failed = new StringBuilder();
+                    failed.Append(string.Format("批处理第 {0}/{1} 步失败: {2} — {3}（code={4}, retry={5}）",
+                        steps.Count, all.Count, seg, ex.Message, code, retry));
+                    if (steps.Count > 1) failed.Append("；已完成: ").Append(string.Join(" ; ", steps.Take(steps.Count - 1).Select(s => (string)s["op"]).ToArray()));
+                    throw new WhException(code, retry, failed.ToString());
                 }
             }
 
@@ -1009,6 +1171,133 @@ namespace WinHarness {
             res["count"] = steps.Count;
             res["steps"] = steps;
             return res;
+        }
+
+        // wndat：诊断用——报告指定屏幕点命中的窗口（WindowFromPoint + 根窗口 + 进程）
+        static object CmdWndAt(Dictionary<string, string> o) {
+            int x = RequireInt(o, "X", "屏幕 X 坐标，可为负数");
+            int y = RequireInt(o, "Y", "屏幕 Y 坐标，可为负数");
+            var p = new Native.POINT { X = x, Y = y };
+            IntPtr hw = Native.WindowFromPoint(p);
+            var res = new Dictionary<string, object>();
+            res["x"] = x; res["y"] = y; res["hwnd"] = hw.ToInt64();
+            if (hw != IntPtr.Zero) {
+                var root = Native.GetAncestor(hw, Native.GA_ROOT);
+                res["root"] = root.ToInt64();
+                uint pid; Native.GetWindowThreadProcessId(root, out pid);
+                var sb = new StringBuilder(256);
+                Native.GetClassName(root, sb, 256);
+                res["class"] = sb.ToString();
+                res["pid"] = pid;
+                Native.RECT r;
+                if (Native.GetWindowRect(root, out r))
+                    res["rect"] = new Dictionary<string, object> { { "x", r.Left }, { "y", r.Top }, { "w", r.Right - r.Left }, { "h", r.Bottom - r.Top } };
+            }
+            res["dpi_mode"] = Native.DpiMode;
+            return res;
+        }
+
+        // surfaces：列出 shell 表面（任务栏/桌面/开始菜单/托盘溢出/通知中心）
+        static object CmdSurfaces(Dictionary<string, string> o) {
+            var list = ShellSurface.List();
+            var res = new Dictionary<string, object>();
+            res["count"] = list.Count;
+            res["surfaces"] = list;
+            return res;
+        }
+
+        // open：打开 shell 表面并返回 hwnd（之后用 -Window shell:<name> 直接操作）
+        static object CmdOpen(Dictionary<string, string> o) {
+            string surface = Opt(o, "Surface");
+            if (string.IsNullOrEmpty(surface))
+                throw new WhException(ErrorCodes.BadArgs, "never",
+                    "需要 -Surface（可用: " + string.Join(" / ", ShellSurface.Names) + "）");
+            int timeout = OptInt(o, "Timeout", 1500);
+            long hwnd = ShellSurface.Open(surface, timeout);
+
+            var res = new Dictionary<string, object>();
+            res["surface"] = surface.ToLowerInvariant();
+            res["hwnd"] = hwnd;
+            res["window"] = "shell:" + surface.ToLowerInvariant();
+            Native.RECT r;
+            if (Native.GetWindowRect(new IntPtr(hwnd), out r)) {
+                res["rect"] = new Dictionary<string, object> {
+                    { "x", r.Left }, { "y", r.Top }, { "w", r.Right - r.Left }, { "h", r.Bottom - r.Top }
+                };
+            }
+            return res;
+        }
+
+        // trace：回读 NDJSON 轨迹。默认返回最近 20 条原始行（不解析，保住字段完整）
+        static object CmdTrace(Dictionary<string, string> o) {
+            string dir = Opt(o, "Dir");
+            if (string.IsNullOrEmpty(dir))
+                dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "win-harness", "trace");
+
+            DateTime from = DateTime.Now.Date;
+            string since = Opt(o, "Since");
+            if (!string.IsNullOrEmpty(since)) {
+                var m = System.Text.RegularExpressions.Regex.Match(since, @"^(\d+)\s*([smhd])$");
+                if (!m.Success) throw new WhException(ErrorCodes.BadArgs, "never", "-Since 格式: 30m / 2h / 3d");
+                double n = double.Parse(m.Groups[1].Value);
+                switch (m.Groups[2].Value) {
+                    case "s": from = DateTime.Now.AddSeconds(-n); break;
+                    case "m": from = DateTime.Now.AddMinutes(-n); break;
+                    case "h": from = DateTime.Now.AddHours(-n); break;
+                    default: from = DateTime.Now.AddDays(-n); break;
+                }
+            }
+
+            var lines = TraceLog.ReadFrom(dir, from).ToList();
+            if (o.ContainsKey("Failed")) lines = lines.Where(l => l.Contains("\"ok\":false")).ToList();
+
+            var res = new Dictionary<string, object>();
+            res["dir"] = dir;
+            res["available"] = lines.Count;
+            res["enabled_this_process"] = TraceLog.Enabled;
+
+            if (o.ContainsKey("Stats")) {
+                int total = 0, failed = 0;
+                long sumMs = 0; long maxMs = 0;
+                var byCode = new Dictionary<string, object>();
+                var byCmd = new Dictionary<string, object>();
+                foreach (var l in lines) {
+                    total++;
+                    string cmd = Grab(l, "\"cmd\":\"([^\"]*)\"");
+                    bool ok = l.Contains("\"ok\":true");
+                    long ms = 0; long.TryParse(Grab(l, "\"ms\":(\\d+)"), out ms);
+                    if (!ok) failed++;
+                    sumMs += ms; if (ms > maxMs) maxMs = ms;
+                    string code = Grab(l, "\"code\":\"([^\"]*)\"");
+                    if (!string.IsNullOrEmpty(code))
+                        byCode[code] = (byCode.ContainsKey(code) ? (int)byCode[code] : 0) + 1;
+                    if (!string.IsNullOrEmpty(cmd)) {
+                        if (!byCmd.ContainsKey(cmd)) byCmd[cmd] = new Dictionary<string, object> { { "count", 0 }, { "failed", 0 }, { "total_ms", 0 } };
+                        var e = (Dictionary<string, object>)byCmd[cmd];
+                        e["count"] = (int)e["count"] + 1;
+                        if (!ok) e["failed"] = (int)e["failed"] + 1;
+                        e["total_ms"] = (int)e["total_ms"] + (int)ms;
+                    }
+                }
+                res["stats"] = new Dictionary<string, object> {
+                    { "total", total }, { "ok", total - failed }, { "failed", failed },
+                    { "avg_ms", total == 0 ? 0 : (int)(sumMs / total) }, { "max_ms", maxMs },
+                    { "by_code", byCode }, { "by_cmd", byCmd }
+                };
+                res["lines"] = new List<object>();
+                return res;
+            }
+
+            int tail = OptInt(o, "Tail", 20);
+            if (tail > 0 && lines.Count > tail) lines = lines.Skip(lines.Count - tail).ToList();
+            res["returned"] = lines.Count;
+            res["lines"] = lines.Cast<object>().ToList();
+            return res;
+        }
+
+        static string Grab(string s, string pattern) {
+            var m = System.Text.RegularExpressions.Regex.Match(s, pattern);
+            return m.Success ? m.Groups[1].Value : null;
         }
 
         // 分词：按空白切分，支持双引号包裹含空格的参数值
@@ -1059,7 +1348,11 @@ namespace WinHarness {
   read      -Window <定位> [-Name <>|-AutomationId <>] [-Index n]   读元素文本(值/文本/名称)
   getprop   -Window <定位> [-Name <>|-AutomationId <>] [-Index n]   读元素属性与支持的 Pattern
   pixel     -X <n> -Y <n>                                 取屏幕像素颜色(视觉验证)
-  ocr       [-Window <定位> | -X -Y -Width -Height] [-Upscale 2] [-Lang zh-Hans] [-Out <路径>]
+  ocr       [-Window <定位> | -X -Y -Width -Height] [-Upscale auto|n] [-Lang zh-Hans] [-Out <路径>]
+  trace     [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]      回读轨迹(需 -Trace 开启记录)
+  surfaces                                                                列出 shell 表面(任务栏/桌面/开始/托盘/通知)
+  open      -Surface <taskbar|taskbar2|desktop|start|overflow|notifications> [-Timeout 1500]
+                                                                          打开 shell 表面并返回 hwnd
                                                            截屏 OCR，返回带屏幕坐标的文本行/词
   do        -Ops <子命令1 ; 子命令2 ; ...>                 批处理，一次进程执行多步(省进程启动开销)
   b64       -Text <>                                      文本转 base64(UTF-8)

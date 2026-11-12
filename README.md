@@ -115,9 +115,67 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 - `MiniJson` 将所有非 ASCII 字符转义为 `\uXXXX`，输出纯 ASCII —— 彻底规避控制台 / 管道编码链（GBK 与 UTF-8 混杂）造成的中文损坏。
 - **`do` 批处理**：复用同一个 `Dispatch` 函数在**同一进程内**执行多步，不另起进程；失败即停并报出第几步失败及原因。
 
+### 1.8 OCR 通道（WinRT）
+
+给「UIA 树几乎为空」的自绘界面（微信 4.0、CAD、部分国产软件）留的通道：`Windows.Media.Ocr` 识别窗口或指定矩形，返回行与词的**屏幕绝对坐标**，可直接喂给 `click -X -Y`。
+
+设计上有意做了三件事，都是为了让失败**可见**而不是静默：
+
+1. **上采样按 DPI 自适应**（`auto`）：DPI ≥ 120 取 1，否则取 2。历史默认值写死 2，在 150% 缩放的屏幕上等于把文字放大到 3 倍后再识别——小字被双三次插值糊掉，局部区域**返回 0 行**且 `ok:true`。实测 2902×1870 窗口：upscale=1 → 1.07s / 156 行 / 命中 11-11；upscale=2 → 1.89s / 145 行 / 命中 9-11。响应里的 `upscale` 与 `upscale_mode`（`auto(dpi=144)` / `explicit`）如实汇报来源。
+2. **空结果必须可判定**：返回 `code:"EMPTY_OCR"` + `warning`，列出「遮挡 / 放大过度 / 确实无字」三种可能，而不是给一个空数组让调用方猜。
+3. **语言与窗口状态显式化**：`-Lang` 请求的语言若未安装，会退回用户语言并返回 `engine_fallback:true` + `warning_lang`（此前是静默降级）；窗口最小化或隐藏到屏幕外时直接报错，而不是返回空结果。
+
+已知边界：`ScreenCap` 用 `Graphics.CopyFromScreen`，抓的是**屏幕像素**而非窗口自身内容——目标被遮挡时会读到别的窗口的文字，这一点无法在工具侧检测，只能靠调用方先 `focus` 置前台。中文按单字拆分，文本匹配前需去空格。
+
 ---
 
+### 1.9 遮挡检测与抓取模式
+
+截图与 OCR 默认走 `Graphics.CopyFromScreen`（屏幕像素），目标被盖住就会**静默读到遮挡者的内容**。为此加了两层：
+
+**检测**（网格采样 24×24 + `WindowFromPoint`）：报告 `occluded`（0–1）、`covered_samples`、`covered_by`（最多 3 个覆盖窗口）。采样而非矩形相交，是因为真实窗口常非矩形（圆角、分层、DWM 阴影），按命中点算更准，代价 <15ms。
+
+**同应用排除**：UWP/WinUI 一个应用常由多个顶层窗口组成（`ApplicationFrameHost` 框架 + `CoreWindow` + XAML 弹出层）。若不放宽判定，计算器会被自己的框架窗口报 7% 遮挡并误触发窗口抓取。判定规则：同 PID、同标题、`IsChild` 父子关系一律不计入遮挡。
+
+**抓取**：`-Capture auto|screen|window`。`window` 走 `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`，取窗口自身内容，天生免疫遮挡；结果若全黑/单色（DirectX 独占、硬件叠加层）自动回退屏幕并标 `screen(fallback)`——否则会从"读错内容"变成"读一片黑"，更难排查。
+
+实测（Navicat 被完全遮挡）：`screen` 抓到 168 行、全是遮挡者 OC Manager 的文字；`window` 抓到 27 行 Navicat 自己的界面，且快 2 倍（521ms vs 1174ms）。
+
+**`-Raise`**：检测到遮挡就置前再抓。必须复用 `Uia.FocusWindow`（ALT 键技巧 + `AttachThreadInput`），裸 `SetForegroundWindow` 从后台进程调用基本无效——实测它返回后窗口仍在原位，却会让我们误报 `raised:true`。
+
+### 1.10 轨迹与错误码
+
+`-Trace`（或 `WIN_HARNESS_TRACE=1`）把每次调用写成一行 NDJSON，落在 `%LOCALAPPDATA%\win-harness\trace\YYYYMMDD.ndjson`：
+
+```json
+{"ts":"...","seq":2,"trace":"848d33c0","cmd":"find","step":2,"of":3,"args":{"Window":"nosuch"},
+ "ok":false,"ms":19,"code":"NOT_FOUND","retry":"reprobe","error":"..."}
+```
+
+设计要点：
+
+- **`do` 批处理共用 trace id**，每步一条带 `step`/`of`；失败时能回溯前几步做了什么（此前只有一句错误文本）
+- **脱敏**：`-Text`/`-TextB64`/`-Args`/`clipboard -Set` 记为 `<redacted:N>`，定位用的 `-Name`/`-AutomationId` 保留
+- **结果关键字段提到顶层**（`occluded`/`capture`/`count`），便于 grep
+- 按天分文件、自动清理 7 天；关闭时零开销
+
+错误码分两类语义：`retry: safe` 可自动重试（超时、OCR 空、最小化），`retry: reprobe` 需重新查树（元素没找到），`retry: never` 必须人来处理（歧义、权限、非法参数）。
+
+### 1.11 shell 表面
+
+任务栏、桌面、开始菜单、托盘溢出、通知中心**都不在 `windows` 的返回里**（它们不是 UIA RootElement 的 Window 子节点，实测 `windows` 只列 7 个普通窗口）。此前调用方只能硬编码 hwnd，系统版本一变就失效。
+
+现在提供 `shell:` 定位别名 + `surfaces` + `open`，定位到 hwnd 后所有现有命令（`tree`/`find`/`click`/`ocr`）直接可用。
+
+实测（Win11 26H2 / build 26300）：`Shell_TrayWnd` 的 UIA 树有 27–28 个元素，托盘图标是带完整名称的 Button（`显示隐藏的图标`、`蓝牙设备需要…`、`电源 电池状态: 已充满 100%`）。
+
+两个踩到的真坑：
+
+- **任务栏 UIA 会间歇性返回空树**（同一 hwnd 先 27 个、稍后 0 个，按一次 `ESC` 后恢复——通常是开始菜单/弹出层残留压制了树）。已加 3 次重试，仍空则标 `uia(empty-after-retry)`。
+- **Win11 开始菜单是 `Wnd_StartFeed`**，不再是 `Windows.UI.Core.CoreWindow`（同标题的 CoreWindow 实测是「设置」）；且本机 `SendInput` 发 `VK_LWIN` 不弹开始菜单，所以改为优先点任务栏开始按钮。
+
 ## 二、功能
+
 
 ### 2.1 窗口管理
 
@@ -154,8 +212,13 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 
 | 命令 | 说明 |
 |---|---|
-| `screenshot [-Window <定位>] [-Monitor n] [-Out <路径>]` | 截图（整个虚拟桌面 / 单显示器 / 指定窗口），返回捕获矩形 |
+| `screenshot [-Window <定位>] [-Monitor n] [-Capture auto\|screen\|window] [-Raise] [-Out <路径>]` | 截图；带 `-Window` 时返回遮挡比例与覆盖者 |
 | `pixel -X -Y` | 取屏幕像素颜色（自绘 UI 的视觉验证手段） |
+| `ocr [-Window <定位> \| -X -Y -Width -Height] [-Upscale auto\|n] [-Lang <>] [-Capture auto\|screen\|window] [-Raise] [-Out <路径>]` | OCR 识别文字，返回行/词的**屏幕绝对坐标**；无 UIA 的自绘界面首选 |
+| `surfaces` | 列出 shell 表面（taskbar / taskbar2 / desktop / start / overflow / notifications） |
+| `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd |
+| `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd / 根窗口 / 进程 / 类名） |
+| `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
 | `clipboard [-Get] \| [-Set -Text]` | 读 / 写剪贴板 |
 | `wait -Window <定位> -Name <> [-Timeout 10] [-Gone]` | 等待元素出现 / 消失 |
 | `do -Ops <子命令1 ; 子命令2 ; ...>` | 批处理，失败即停并定位到具体步骤 |
@@ -192,11 +255,11 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 | **Win32 经典控件** | 资源管理器、旧版记事本、对话框、菜单/列表/树/编辑框 | 63 | 63–67 | uia | **★★★★★** | 老式自绘 ListView 单元格 |
 | **WinForms** | .NET 桌面应用 | — | — | uia | **★★★★★** | 无实质短板 |
 | **WPF** | — | — | — | uia | **★★★★★** | 虚拟化列表需 `-Scroll` |
-| **UWP / WinUI** | 计算器、设置、商店应用 | 41 | 41 | uia | **★★★★☆** | 合成组合键常不响应 → 改用 `setvalue` |
-| **Qt** | Navicat | 46 | 46 | uia | **★★★☆☆** | QML（Qt Quick）暴露差；需应用开启无障碍 |
+| **UWP / WinUI** | 计算器、设置、商店应用 | 41 | 41 | uia | **★★★★★** | 计算器实测 51 个按钮、aid 稳定（`num7Button`）；合成组合键常不响应 → 改用 `setvalue` |
+| **Qt** | Navicat | 46 | 46 | uia | **★★★☆☆** | Navicat 17 实测 34 个 Pane 且**几乎无名称**（aid 为数字）→ 定位靠 OCR + 坐标 |
 | **WebView2 / Electron** | OC Manager / VS Code / Clash Verge | 13 / 6 / 11 | 13 / **9** / 11 | uia / **msaa** | **★★★☆☆**（仅外壳） | 摸不到页面内容 → **用 CDP** |
 | **Chromium（浏览器）** | Edge | 7 | **17** | msaa-fallback | **★★★☆☆**（仅外壳） | 同上 |
-| **自绘 UI** | 微信 4.0、部分国产软件、CAD、游戏启动器 | 3 | 3 | uia | **★★☆☆☆** | UIA 几乎为空，只剩截图 + `pixel` + `hover` 探测 + 坐标 |
+| **自绘 UI** | 微信 4.0、部分国产软件、CAD、游戏启动器 | 3 | 3 | uia | **★★★☆☆**（配 OCR） | UIA 几乎为空 → 用 `ocr` 拿文本+屏幕坐标直点；纯图标/图形仍只能截图 + `pixel` + `hover` |
 | **XAML（系统组件）** | 任务管理器 | 2 | 2 | uia | **★☆☆☆☆** | 几乎无有效暴露 |
 | **Office** | Word / Excel / PPT | — | — | uia | **★★☆☆☆** | 仅 Ribbon / 对话框可控，**文档正文不可控** |
 | **DirectX 全屏游戏** | — | — | — | — | **☆☆☆☆☆** | 架构上不支持 |
@@ -244,6 +307,14 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 | 负数坐标被解析成「无值开关」 | 左/上副屏上 `click`/`hover`/`drag`/`scroll`/`pixel` **全部不可用** | 参数解析器区分「选项名」与「负数值」；`click` 不再用 `值 >= 0` 判断是否走坐标路径 |
 | 坐标丢失伪装成元素歧义 | 报「匹配到 N 个元素（无过滤条件）」，把「参数丢了」伪装成「元素歧义」，排障方向被带偏 | 坐标缺失/无效时直接报坐标错误；无任何条件时明确要求给坐标或元素条件 |
 | `setwindow` 的 `applied` 与 `rect` 自相矛盾 | 同一响应出现两个矛盾矩形（跨 DPI 移动后 1.5x 差异），易被误读 | `applied` 只列动作名；新增 `requested_rect` / `geometry_note` / `monitor_index` |
+| `ocr` 默认 `-Upscale 2` | 高 DPI 屏上文字已被系统放大渲染，再放大 2 倍导致更慢更差，局部小字区域**返回 0 行却 `ok:true`** | 默认改 `auto`：DPI≥120 取 1；响应新增 `upscale` / `upscale_mode` |
+| `ocr` 空结果静默成功 | 调用方误判「这里没有文字」，OCR 看起来像坏了 | 返回 `code:"EMPTY_OCR"` + `warning`（遮挡 / 放大过度 / 确实无字三选一提示） |
+| `ocr -Lang` 静默回退 | 传 `en-US` 实际仍用 `zh-Hans-CN`，无从察觉 | 返回 `engine_fallback:true` + `warning_lang`，并给实际 `engine` |
+| `ocr` 对最小化 / 隐藏窗口 | 返回空数组，表现为「工具不可用」 | 前置检查 `IsIconic` 与 `rect ≤ -20000`，直接报错要求先 `focus` 还原 |
+| 截图/OCR 只抓屏幕像素 | 目标被遮挡时**静默读到遮挡者的内容**（Navicat 实测：screen 168 行全是别人的字，window 27 行才对） | 新增遮挡检测 + `-Capture window` 走 `PrintWindow` |
+| `-Raise` 用裸 `SetForegroundWindow` | 后台进程调用基本无效，却报 `raised:true` | 改用 `Uia.FocusWindow`（ALT 技巧 + AttachThreadInput） |
+| 遮挡把 UWP 自身部件算成遮挡者 | 计算器被自己框架报 7% 遮挡 | 同 PID / 同标题 / 父子窗口不计入 |
+| shell 窗口不在 `windows` 里 | 拿不到 hwnd，只能硬编码 | `shell:` 别名 + `surfaces` + `open` |
 
 > **反思 A（语义层面）**：列表项点击与 autofocus 两条是**同一个思维错误的两种表现** ——
 > 把「控件语义动作」等同于「用户操作」。`Invoke` ≠ 点击，`SetFocus` ≠ 点击。
@@ -264,6 +335,11 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 | 11 个新命令冒烟 | 通过 |
 | 歧义护栏（元素 / 窗口） | 通过 |
 | 总计 | **21 / 24**（3 个 FAIL 均为歧义护栏正确拦截，非缺陷） |
+| OCR 通道（150% DPI 屏实测） | 通过：`auto` → upscale=1 / 1.16s / 156 行 / 已知标签 11-11；显式 `-Upscale 2` 返回 `EMPTY_OCR`；`-Lang en-US` 返回 `engine_fallback`；最小化窗口显式报错 |
+| 实机三应用（计算器 / 微信 / Navicat） | 通过：计算器 7 步批处理 `78+8=86` 并回读；微信 OCR 35 行、PrintWindow 可用；Navicat 遮挡下 `window` 模式 27 行正确、`screen` 模式 168 行错误 |
+| 遮挡检测与 `-Raise` | 通过：完全遮挡 `occluded=1`，`-Raise` 后 `0`；UWP 自身窗口不误报 |
+| Trace / 错误码 | 通过：`do` 三步第 2 步失败 → 3 条 NDJSON 带 `step/of/code/retry`；`-Stats` 聚合正确 |
+| shell 表面 | 部分通过：`taskbar`（27–28 元素）、`taskbar2`、`desktop`、`overflow` 可用；`start` / `notifications` 为 best-effort，本机未验证通过 |
 
 ---
 
@@ -281,7 +357,11 @@ win-harness/
     └── src/
         ├── Native.cs           P/Invoke：窗口 / 鼠标键盘 / DPI / 剪贴板 / MSAA
         ├── Uia.cs              UIA 封装 + FindSpec/ResolveOne + MSAA 遍历
-        ├── InputSim.cs         SendInput 鼠标键盘 / 剪贴板 / 截图 / 显示器几何
+        ├── InputSim.cs         SendInput 鼠标键盘 / 剪贴板 / 截图（含 PrintWindow 窗口抓取）
+        ├── Ocr.cs              WinRT OCR 封装（自适应上采样 / 语言回退上报）
+        ├── Occlusion.cs        遮挡检测（网格采样 / 同应用排除）与 -Raise
+        ├── ShellSurface.cs     shell 表面定位（taskbar / desktop / start / overflow）
+        ├── Codes.cs            错误码 / retry 语义 / NDJSON 轨迹日志
         └── WinHarness.cs       CLI 主程序 + 命令分发 + 批处理 + MiniJson
 ```
 

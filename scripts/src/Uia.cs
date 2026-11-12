@@ -70,6 +70,22 @@ namespace WinHarness {
         public static AutomationElement ResolveWindow(string spec, int index, bool indexExplicit) {
             if (string.IsNullOrEmpty(spec)) throw new Exception("缺少 -Window 参数（标题 / pid:123 / hwnd:123）");
 
+            // shell 表面别名：shell:taskbar / desktop / start / overflow / notifications
+            // 必要性：这些窗口不在 UIA RootElement 的 Window 子节点里，windows 命令根本列不到它们，
+            // 调用方只能靠硬编码 hwnd，版本一变就失效。
+            if (spec.StartsWith("shell:", StringComparison.OrdinalIgnoreCase)) {
+                string name = spec.Substring(6);
+                long sh = ShellSurface.Find(name);
+                if (sh == 0) {
+                    throw new WhException(ErrorCodes.NotFound, "reprobe",
+                        "shell 表面 '" + name + "' 当前不存在（未打开或本系统无此表面）。"
+                        + "可用: " + ShellSurface.Names + "；可先 open -Surface " + name + " 打开");
+                }
+                var sel = AutomationElement.FromHandle(new IntPtr(sh));
+                if (sel == null) throw new WhException(ErrorCodes.NotFound, "reprobe", "shell 表面 '" + name + "' 无有效 UIA 元素");
+                return sel;
+            }
+
             if (spec.StartsWith("hwnd:")) {
                 long h;
                 if (!long.TryParse(spec.Substring(5), out h)) throw new Exception("hwnd 格式错误: " + spec);

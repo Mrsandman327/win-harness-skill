@@ -19,6 +19,7 @@ namespace WinHarness {
             if (upscale < 1) upscale = 1;
             var lines = new List<Dictionary<string, object>>();
             string engineTag;
+            bool langFallback;
 
             using (var src = new Bitmap(srcPng)) {
                 Bitmap ocrBmp = src;
@@ -36,7 +37,7 @@ namespace WinHarness {
                     using (var ms = new MemoryStream()) {
                         ocrBmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
                         ms.Position = 0;
-                        var engine = CreateEngine(lang);
+                        var engine = CreateEngine(lang, out langFallback);
                         engineTag = engine.RecognizerLanguage.LanguageTag;
                         var ras = ms.AsRandomAccessStream();
                         try {
@@ -56,17 +57,24 @@ namespace WinHarness {
 
             var res = new Dictionary<string, object>();
             res["engine"] = engineTag;
+            res["lang_fallback"] = langFallback;
             res["lines"] = lines;
             return res;
         }
 
-        // 语言包缺失时给出可用语言列表，便于调用方改用 -Lang
-        static OcrEngine CreateEngine(string lang) {
+        // 语言包缺失时给出可用语言列表，便于调用方改用 -Lang。
+        // langFallback=true 表示请求语言不可用、已退回「用户配置语言」——必须如实上报，
+        // 否则调用方会以为 -Lang 生效，实际仍在用别的语言引擎识别（静默降级）。
+        static OcrEngine CreateEngine(string lang, out bool langFallback) {
+            langFallback = false;
             OcrEngine engine = null;
             if (!string.IsNullOrEmpty(lang)) {
                 try { engine = OcrEngine.TryCreateFromLanguage(new Language(lang)); } catch { engine = null; }
             }
-            if (engine == null) engine = OcrEngine.TryCreateFromUserProfileLanguages();
+            if (engine == null) {
+                engine = OcrEngine.TryCreateFromUserProfileLanguages();
+                langFallback = engine != null;
+            }
             if (engine == null) {
                 var avail = new List<string>();
                 try { foreach (var l in OcrEngine.AvailableRecognizerLanguages) avail.Add(l.LanguageTag); } catch { }

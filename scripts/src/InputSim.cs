@@ -167,6 +167,54 @@ namespace WinHarness {
 
     // 截图（全屏 / 指定矩形 / 指定显示器）
     static class ScreenCap {
+        // 窗口自身内容（免疫遮挡）：PrintWindow + PW_RENDERFULLCONTENT(0x2)。
+        // 返回 null 表示该窗口不支持（DirectX 独占、部分硬件加速表面），调用方退回 CopyFromScreen。
+        public static Dictionary<string, object> CaptureWindow(IntPtr hwnd, Native.RECT rect, string outPath) {
+            int x = rect.Left, y = rect.Top;
+            int w = rect.Right - rect.Left, h = rect.Bottom - rect.Top;
+            if (w <= 0 || h <= 0) return null;
+            if (string.IsNullOrEmpty(outPath)) {
+                outPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "win-harness-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".png");
+            }
+
+            using (var bmp = new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+                IntPtr hdc = g.GetHdc();
+                bool ok;
+                try { ok = Native.PrintWindow(hwnd, hdc, 2); }
+                finally { g.ReleaseHdc(hdc); }
+                if (!ok) return null;
+
+                // 全黑/单色说明该窗口不支持 PrintWindow（DirectX 独占、硬件叠加层）。
+                // 必须判定：否则会从"读错内容"变成"读一片黑"，反而更难排查。
+                if (IsBlank(bmp)) return null;
+
+                bmp.Save(outPath, System.Drawing.Imaging.ImageFormat.Png);
+            }
+
+            var res = new Dictionary<string, object>();
+            res["path"] = outPath;
+            res["x"] = x; res["y"] = y; res["w"] = w; res["h"] = h;
+            return res;
+        }
+
+        // 采样判断"空白图"：全透明，或所有采样点亮度几乎无差异
+        static bool IsBlank(System.Drawing.Bitmap bmp) {
+            int minL = 255, maxL = 0, opaque = 0;
+            int stepX = Math.Max(1, bmp.Width / 16), stepY = Math.Max(1, bmp.Height / 16);
+            for (int yy = 0; yy < bmp.Height; yy += stepY) {
+                for (int xx = 0; xx < bmp.Width; xx += stepX) {
+                    var c = bmp.GetPixel(xx, yy);
+                    if (c.A > 8) opaque++;
+                    int l = (c.R * 299 + c.G * 587 + c.B * 114) / 1000;
+                    if (l < minL) minL = l;
+                    if (l > maxL) maxL = l;
+                }
+            }
+            if (opaque == 0) return true;          // 全透明
+            return (maxL - minL) <= 2;             // 亮度几乎无变化
+        }
+
         // 返回 {path, x, y, w, h}：报告实际捕获矩形，供调用方把图片坐标换算回屏幕坐标。
         public static Dictionary<string, object> Capture(Native.RECT? rect, int monitor, string outPath) {
             int x, y, w, h;
