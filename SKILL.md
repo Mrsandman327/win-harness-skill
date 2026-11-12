@@ -260,13 +260,14 @@ Chromium 系应用（Edge / Electron / WebView2 / Tauri）的 UIA 树极浅，�
 | `taskbar2` | ✅（副屏 `Shell_SecondaryTrayWnd`） |
 | `desktop` | ✅ `Progman` |
 | `overflow` | ✅ `TopLevelWindowForOverflowXamlIsland`，标题「系统托盘溢出窗口。」 |
-| `start` | ⚠️ 见下 |
-| `notifications` | ⚠️ 未实测通过 |
+| `start` | ✅ **可打开**（点任务栏 `StartButton`）：`open -Surface start` 返回 `clicked:true`、`hwnd:0`、`addressing:"none"`——菜单确实会弹出，但它由 XAML 合成层绘制，**没有可寻址窗口**，之后用 `clicktext` 操作 |
+| `notifications` | ✅ **可打开**（点任务栏时钟，Win11 已把日历/通知合并）：同样 `hwnd:0`，OCR 实测能读到「11月12日，星期四 / 2026 年 11 月 / 开始专注」 |
 
 **两个已知坑：**
 
 1. **任务栏 UIA 树会间歇性返回 0 个元素**（同一 hwnd 先 27 个、稍后 0 个，按一次 `ESC` 后又恢复——通常是开始菜单/弹出层残留把树压制了）。`tree -Window shell:*` 已内置 3 次重试；仍为空时 `backend` 会标 `uia(empty-after-retry)`，此时改用 `screenshot` + `ocr` 兜底。
-2. **开始菜单在 Win11 是 `Wnd_StartFeed`**，不再是老的 `Windows.UI.Core.CoreWindow`（同标题的 CoreWindow 实测是「设置」）。另外本机 **`SendInput` 发 `VK_LWIN` 不弹开始菜单**，所以 `open -Surface start` 改为先点任务栏的开始按钮，再退回 WIN 键。若两条都失败会明确报错，不会静默。
+2. **开始菜单 / 通知中心没有可寻址窗口**（Win11）：`open` 会点任务栏按钮把面板唤起，返回 `clicked:true` + `hwnd:0` + `addressing:"none"`。这不是失败，是这类表面的固有形态——**后续一律用 `clicktext -X -Y -Width -Height -Text <文字>` 操作**（已实测从开始菜单点开计算器）。
+   - 顺手记一个坑：本机 `SendInput` 发 `VK_LWIN` / `Ctrl+Esc` 都**不会**弹开始菜单，只有点 `StartButton` 才行；`WIN+N` 同样不行，所以通知中心改为点任务栏时钟。
 
 ## 按文字点击（`clicktext`）
 

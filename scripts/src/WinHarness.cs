@@ -1035,21 +1035,34 @@ namespace WinHarness {
 
             // 归一化：去掉所有空白后再比较，绕开中文被拆成单字的问题
             string want = Normalize(text);
-            var hits = new List<Dictionary<string, object>>();
+            var scored = new List<KeyValuePair<int, Dictionary<string, object>>>();
             foreach (var l in (List<Dictionary<string, object>>)ocr["lines"]) {
                 string lt = Normalize((string)l["text"]);
                 if (lt.Length == 0) continue;
                 // 反向包含（ocr 行比查询更短）只在行本身有 2 个字符以上时才算，
                 // 否则单字碎片（"e"、"0"）会把几乎所有查询都匹配上
-                if (lt.Contains(want) || (want.Length >= 4 && lt.Length >= 2 && want.Contains(lt))) {
-                    var d = new Dictionary<string, object>();
-                    d["text"] = l["text"];
-                    d["x"] = Convert.ToInt32(l["x"]) + rx;
-                    d["y"] = Convert.ToInt32(l["y"]) + ry;
-                    d["w"] = l["w"]; d["h"] = l["h"];
-                    hits.Add(d);
-                }
+                int score;
+                if (lt == want) score = 0;                                  // 完全相同
+                else if (lt.Contains(want)) score = 1;                      // 行包含查询
+                else if (want.Length >= 4 && lt.Length >= 2 && want.Contains(lt)) score = 2;  // 查询包含行
+                else continue;
+
+                var d = new Dictionary<string, object>();
+                d["text"] = l["text"];
+                d["x"] = Convert.ToInt32(l["x"]) + rx;
+                d["y"] = Convert.ToInt32(l["y"]) + ry;
+                d["w"] = l["w"]; d["h"] = l["h"];
+                d["score"] = score;
+                scored.Add(new KeyValuePair<int, Dictionary<string, object>>(Math.Abs(lt.Length - want.Length), d));
             }
+            // 排序：先精确度分档，再按长度差（越接近查询越可能是目标）——让 -Index 0 更有意义
+            scored.Sort((a, b) => {
+                int sa = (int)a.Value["score"], sb = (int)b.Value["score"];
+                if (sa != sb) return sa.CompareTo(sb);
+                return a.Key.CompareTo(b.Key);
+            });
+            var hits = new List<Dictionary<string, object>>();
+            foreach (var kv in scored) hits.Add(kv.Value);
 
             var res = new Dictionary<string, object>();
             res["query"] = text;
@@ -1324,24 +1337,34 @@ namespace WinHarness {
             return res;
         }
 
-        // open：打开 shell 表面并返回 hwnd（之后用 -Window shell:<name> 直接操作）
+        // open：打开 shell 表面；可寻址的返回 hwnd，XAML 合成层返回 clicked + 操作建议
         static object CmdOpen(Dictionary<string, string> o) {
             string surface = Opt(o, "Surface");
             if (string.IsNullOrEmpty(surface))
                 throw new WhException(ErrorCodes.BadArgs, "never",
                     "需要 -Surface（可用: " + string.Join(" / ", ShellSurface.Names) + "）");
             int timeout = OptInt(o, "Timeout", 1500);
-            long hwnd = ShellSurface.Open(surface, timeout);
+            long hwnd; bool clicked;
+            ShellSurface.Open(surface, timeout, out hwnd, out clicked);
 
             var res = new Dictionary<string, object>();
             res["surface"] = surface.ToLowerInvariant();
             res["hwnd"] = hwnd;
-            res["window"] = "shell:" + surface.ToLowerInvariant();
-            Native.RECT r;
-            if (Native.GetWindowRect(new IntPtr(hwnd), out r)) {
-                res["rect"] = new Dictionary<string, object> {
-                    { "x", r.Left }, { "y", r.Top }, { "w", r.Right - r.Left }, { "h", r.Bottom - r.Top }
-                };
+            if (hwnd != 0) {
+                res["window"] = "shell:" + surface.ToLowerInvariant();
+                Native.RECT r;
+                if (Native.GetWindowRect(new IntPtr(hwnd), out r)) {
+                    res["rect"] = new Dictionary<string, object> {
+                        { "x", r.Left }, { "y", r.Top }, { "w", r.Right - r.Left }, { "h", r.Bottom - r.Top }
+                    };
+                }
+            } else if (clicked) {
+                // 已唤起但无可寻址窗口：这是设计内的结果，不是失败
+                res["clicked"] = true;
+                res["addressing"] = "none";
+                res["hint"] = "该表面由 XAML 合成层绘制，没有可寻址的窗口句柄。"
+                    + "请用 clicktext -X -Y -Width -Height -Text <文字> 直接按屏幕文字点击，"
+                    + "或用 screenshot / ocr 确认面板内容。";
             }
             return res;
         }

@@ -172,7 +172,8 @@ Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自
 两个踩到的真坑：
 
 - **任务栏 UIA 会间歇性返回空树**（同一 hwnd 先 27 个、稍后 0 个，按一次 `ESC` 后恢复——通常是开始菜单/弹出层残留压制了树）。已加 3 次重试，仍空则标 `uia(empty-after-retry)`。
-- **Win11 开始菜单是 `Wnd_StartFeed`**，不再是 `Windows.UI.Core.CoreWindow`（同标题的 CoreWindow 实测是「设置」）；且本机 `SendInput` 发 `VK_LWIN` 不弹开始菜单，所以改为优先点任务栏开始按钮。
+- **Win11 开始菜单 / 通知中心没有可寻址窗口**：`open -Surface start|notifications` 会点任务栏按钮唤起面板，返回 `clicked:true` + `hwnd:0` + `addressing:"none"`。这不是失败——面板由 XAML 合成层绘制，`Wnd_StartFeed` 恒为不可见、`WindowFromPoint` 也命中不到。后续用 `clicktext -X -Y -Width -Height -Text <文字>` 操作（实测从开始菜单点开了计算器；通知中心 OCR 能读到「11月12日，星期四 / 2026 年 11 月 / 开始专注」）。
+- **合成按键不可靠**：本机 `SendInput` 发 `VK_LWIN`、`Ctrl+Esc` 都不弹开始菜单，`WIN+N` 也不弹通知中心；只有点任务栏按钮有效。所以 `open` 的实现是"点按钮优先，键击兜底"。
 
 ### 1.12 查找性能
 
@@ -378,7 +379,7 @@ clicktext -X 440 -Y 260 -Width 1100 -Height 1520 -Text "计算器"
 | 实机三应用（计算器 / 微信 / Navicat） | 通过：计算器 7 步批处理 `78+8=86` 并回读；微信 OCR 35 行、PrintWindow 可用；Navicat 遮挡下 `window` 模式 27 行正确、`screen` 模式 168 行错误 |
 | 遮挡检测与 `-Raise` | 通过：完全遮挡 `occluded=1`，`-Raise` 后 `0`；UWP 自身窗口不误报 |
 | Trace / 错误码 | 通过：`do` 三步第 2 步失败 → 3 条 NDJSON 带 `step/of/code/retry`；`-Stats` 聚合正确 |
-| shell 表面 | 部分通过：`taskbar`（27–28 元素）、`taskbar2`、`desktop`、`overflow` 可用；`start` / `notifications` 为 best-effort，本机未验证通过 |
+| shell 表面 | 通过：`taskbar`（27–28 元素）、`taskbar2`、`desktop`、`overflow` 可寻址；`start` / `notifications` 可打开但无可寻址窗口（`addressing:"none"`），用 `clicktext` 操作，已实测点开计算器 |
 | 查找性能（Chromium 窗口 2000+ 元素） | 通过：`-AutomationId` 2000→400ms，`-Name -Exact` 2000→390ms，`-Type` 2100→650ms，模糊 `-Name` 1600ms |
 | 回归套件（22 项，`wh-regress.ps1`） | 22/22 通过（微信窗口不可见时跳过该项） |
 

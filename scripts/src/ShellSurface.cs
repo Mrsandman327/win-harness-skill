@@ -93,21 +93,27 @@ namespace WinHarness {
                     Native.GetWindowText(new IntPtr(h), tb, 256);
                     if (tb.Length > 0) d["title"] = tb.ToString();
                 } else {
-                    d["openable_by"] = n == "start" ? "key -Keys WIN"
-                        : n == "notifications" ? "key -Keys WIN,N"
-                        : n == "overflow" ? "click 任务栏的『显示隐藏的图标』"
+                    d["openable_by"] = n == "start" ? "open -Surface start（点任务栏开始按钮）"
+                        : n == "notifications" ? "open -Surface notifications（点任务栏时钟；Win11 合并了日历）"
+                        : n == "overflow" ? "open -Surface overflow（点任务栏『显示隐藏的图标』）"
                         : "通常由系统常驻";
+                    // 开始菜单 / 通知中心在本机由 XAML 合成层绘制，没有可寻址窗口
+                    if (n == "start" || n == "notifications") d["addressing"] = "none";
                 }
                 list.Add(d);
             }
             return list;
         }
 
-        // 打开某个 shell 表面并返回其 hwnd（轮询等待出现）
-        public static long Open(string name, int timeoutMs) {
+        // 打开某个 shell 表面。
+        // hwnd != 0 → 可寻址，之后用 -Window shell:<name> 操作；
+        // hwnd == 0 → 该表面是 XAML 合成层（开始菜单 / 通知中心），没有可寻址窗口，
+        //             只能确认"已点击唤起"，后续用 clicktext / screenshot 操作。
+        public static void Open(string name, int timeoutMs, out long hwnd, out bool clicked) {
             name = (name ?? "").ToLowerInvariant();
-            long h = Find(name);
-            if (h != 0 && name != "start" && name != "notifications" && name != "overflow") return h;
+            hwnd = Find(name);
+            clicked = false;
+            if (hwnd != 0 && name != "start" && name != "notifications" && name != "overflow") return;
 
             switch (name) {
                 case "start":
@@ -115,16 +121,20 @@ namespace WinHarness {
                     // 改为点任务栏的开始按钮；两者都失败才放弃。
                     if (!ClickTaskbar(new[] { "开始", "Start" }, "StartButton") && !ClickTaskbar(new[] { "开始", "Start" }, "Start"))
                         InputSim.KeyPress("WIN");
+                    clicked = true;
                     break;
                 case "notifications":
-                    if (!ClickTaskbar(new[] { "通知", "Notification", "操作中心" }, "NotificationsButton"))
+                    // 通知中心 = 点任务栏时钟（Win11 合并了日历/通知）
+                    if (!ClickTaskbar(new[] { "时钟", "通知", "Notification", "Clock" }, "NotificationsButton"))
                         InputSim.KeyPress("WIN+N");
+                    clicked = true;
                     break;
                 case "overflow":
                     ClickChevron();
+                    clicked = true;
                     break;
                 case "taskbar": case "taskbar2": case "desktop":
-                    return Find(name);
+                    return;
                 default:
                     throw new WhException(ErrorCodes.BadArgs, "never",
                         "未知 -Surface '" + name + "'，可用: " + string.Join(" / ", Names));
@@ -134,12 +144,10 @@ namespace WinHarness {
             while (waited < timeoutMs) {
                 Thread.Sleep(120);
                 waited += 120;
-                h = Find(name);
-                if (h != 0) return h;
+                hwnd = Find(name);
+                if (hwnd != 0) return;
             }
-            throw new WhException(ErrorCodes.NotFound, "safe",
-                "已尝试打开 shell:" + name + "，但 " + timeoutMs + "ms 内未出现。"
-                + "若按钮名称被系统语言改写，请先 windows/screenshot 人工确认。");
+            hwnd = 0;   // 唤起动作已执行，但没有可寻址窗口（属于预期，不是失败）
         }
 
         // 点任务栏上名字命中 words（或 AutomationId 命中 aid）的按钮。
