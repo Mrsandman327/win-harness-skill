@@ -211,7 +211,18 @@ clicktext -X 440 -Y 260 -Width 1100 -Height 1520 -Text "计算器"
 - **模糊匹配有边界**：归一化去空白后「行包含查询」或「查询包含行（行 ≥2 字）」，避免单字碎片匹配一切
 - **区域模式**（`-X -Y -Width -Height`）比全窗快一个量级，弹层场景务必用
 
+### 1.14 环境自检（`status`）
+
+UIA 自动化的失败原因高度集中：没提权、目标在别的会话、桌面被锁、DPI 模式不对、没装 OCR 语言包。以前这些都只能靠文档猜，现在一条命令全查出来。
+
+覆盖面：进程与会话（pid / arch / clr / session / 桌面名 / 是否提权）、显示（DPI 模式、每台显示器的 bounds 与实际 DPI、虚拟桌面尺寸）、OCR（系统已装语言包，空数组即 `ocr`/`clicktext` 不可用）、前台窗口（键盘输入会发到这里）、trace 状态与目录、shell 表面可用性（`-NoSurfaces` 可跳过）。
+
+本机实测：Windows 10 Pro 26H2 / build 26300.9711、session 7、未提权、`per-monitor-v2`、双屏 2880×1920@150% + 1920×1080@100%、OCR 语言包 `zh-Hans-CN`。
+
+两个字段陷阱写在这里省得后人再踩：`os` 在无应用清单时会谎报 `6.2`（Win8），**以 `os_build` 为准**；`os_version` 里的 `ProductName` 在 Win11 上仍写 `Windows 10`，是系统注册表自身的习惯，不是我们读错了。
+
 ## 二、功能
+
 
 
 
@@ -257,6 +268,7 @@ clicktext -X 440 -Y 260 -Width 1100 -Height 1520 -Text "计算器"
 | `surfaces` | 列出 shell 表面（taskbar / taskbar2 / desktop / start / overflow / notifications） |
 | `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd |
 | `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd / 根窗口 / 进程 / 类名） |
+| `status [-NoSurfaces]` | 环境自检：提权 / 会话 / 桌面 / DPI / 显示器 / OCR 语言包 / 前台 / trace |
 | `clicktext (-Window <定位> \| -X -Y -Width -Height) -Text <文字> [-Index 0] [-DryRun]` | 按屏幕上的文字点击（OCR 定位，不依赖 UIA） |
 | `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
 | `clipboard [-Get] \| [-Set -Text]` | 读 / 写剪贴板 |

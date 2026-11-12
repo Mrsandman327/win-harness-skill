@@ -13,6 +13,15 @@ using Windows.Media.Ocr;
 
 namespace WinHarness {
     static class OcrRunner {
+        // 系统已安装的 OCR 语言包（供 status 报告；空数组说明系统没有任何 OCR 能力）
+        public static List<string> AvailableLanguages() {
+            var list = new List<string>();
+            try {
+                foreach (var l in OcrEngine.AvailableRecognizerLanguages) list.Add(l.LanguageTag);
+            } catch { }
+            return list;
+        }
+
         // 识别 PNG 文件；upscale>=2 时先按整数倍高质量插值放大（提升小字号识别率）。
         // 返回 {engine:"<语言Tag>", lines:[{text,x,y,w,h,words:[{text,x,y,w,h}]}]}
         public static Dictionary<string, object> Recognize(string srcPng, string lang, int upscale) {

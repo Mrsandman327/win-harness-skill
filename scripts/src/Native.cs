@@ -100,6 +100,44 @@ namespace WinHarness {
             } catch { }
         }
 
+        // ---- 进程/会话信息（status 命令）----
+        [DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)] public static extern bool GetTokenInformation(IntPtr token, int cls, out int info, int len, out int ret);
+        [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")] public static extern bool ProcessIdToSessionId(int pid, out int sessionId);
+        [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint threadId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetUserObjectInformation(IntPtr obj, int index, StringBuilder info, int len, out int needed);
+        public const uint TOKEN_QUERY = 0x0008;
+        public const int TokenElevation = 20;
+
+        // 当前进程是否已提权（UIPI 决定能否驱动提权窗口）
+        public static bool IsElevated() {
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out token)) return false;
+            try {
+                int info, ret;
+                if (GetTokenInformation(token, TokenElevation, out info, 4, out ret)) return info != 0;
+                return false;
+            } finally { CloseHandle(token); }
+        }
+
+        // 进程所在会话 + 桌面名（交互式桌面才能做 UIA/截图）
+        public static int SessionId() {
+            int sid;
+            return ProcessIdToSessionId(System.Diagnostics.Process.GetCurrentProcess().Id, out sid) ? sid : -1;
+        }
+
+        public static string DesktopName() {
+            try {
+                var sb = new StringBuilder(256);
+                int needed;
+                if (GetUserObjectInformation(GetThreadDesktop(GetCurrentThreadId()), 2 /*UOI_NAME*/, sb, 512, out needed))
+                    return sb.ToString();
+            } catch { }
+            return "";
+        }
+
         // ---- 遮挡检测（Occlusion.cs）----
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int X; public int Y; }

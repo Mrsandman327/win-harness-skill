@@ -61,6 +61,10 @@ if ($wx) {
 # --- 区域 OCR ---
 $r = J @('ocr', '-X', '0', '-Y', '0', '-Width', '300', '-Height', '80'); Check 'ocr region' $r.ok "lines=$($r.data.lines.Count)"
 
+# --- status ---
+$r = J @('status', '-NoSurfaces')
+Check 'status' ($r.ok -and $null -ne $r.data.elevated -and $r.data.monitors.Count -ge 1) "elevated=$($r.data.elevated) dpi=$($r.data.dpi_mode)"
+
 # --- shell ---
 $r = J @('surfaces'); Check 'surfaces' ($r.ok -and $r.data.count -eq 6) "count=$($r.data.count)"
 $r = J @('tree', '-Window', 'shell:taskbar', '-Depth', '2')

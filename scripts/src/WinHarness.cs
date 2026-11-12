@@ -102,6 +102,7 @@ namespace WinHarness {
                 case "trace": return CmdTrace(opts);
                 case "surfaces": return CmdSurfaces(opts);
                 case "wndat": return CmdWndAt(opts);
+                case "status": return Status.Collect(!Flag(opts, "NoSurfaces"));
                 case "open": return CmdOpen(opts);
                 case "clicktext": return CmdClickText(opts);
                 case "do": return CmdDo(opts);
@@ -1493,6 +1494,7 @@ namespace WinHarness {
   clicktext -Window <定位> -Text <文字> [-Index 0] [-DryRun] [-Capture auto|screen|window]
                                                                           OCR 文字定位并点击(自绘/弹层兜底)
   trace     [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]      回读轨迹(需 -Trace 开启记录)
+  status    [-NoSurfaces]                                                 环境自检(提权/会话/DPI/显示器/OCR/前台/trace)
   surfaces                                                                列出 shell 表面(任务栏/桌面/开始/托盘/通知)
   open      -Surface <taskbar|taskbar2|desktop|start|overflow|notifications> [-Timeout 1500]
                                                                           打开 shell 表面并返回 hwnd

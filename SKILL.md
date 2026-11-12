@@ -45,6 +45,7 @@ $W = ".\scripts\win-harness.exe"
 | `open -Surface <名字> [-Timeout 1500]` | 打开 shell 表面并返回 hwnd（之后用 `-Window shell:<名字>` 操作） |
 | `trace [-Tail 20] [-Failed] [-Since 2h] [-Stats] [-Dir <目录>]` | 回读调用轨迹（需 `-Trace` 才记录） |
 | `wndat -X -Y` | 诊断：报告该点命中的窗口（hwnd/根窗口/进程/类名） |
+| `status [-NoSurfaces]` | 环境自检：提权/会话/桌面/DPI/显示器/OCR 语言包/前台窗口/trace |
 | `clicktext (-Window <定位> \| -X -Y -Width -Height) -Text <文字> [-Index 0] [-DryRun] [-NoWords]` | **按屏幕上的文字点击**（不依赖 UIA），自绘界面/XAML 弹层/任务栏空树时的兜底 |
 | `do -Ops <子命令1 ; 子命令2 ; ...>` | 批处理，一次进程执行多步 |
 | `b64 -Text <>` | 文本转 base64（备用） |
@@ -289,7 +290,26 @@ Chromium 系应用（Edge / Electron / WebView2 / Tauri）的 UIA 树极浅，�
 
 代价：OCR 有误识（小字经常错 1–2 个汉字），所以**关键操作要配 `-DryRun` + 结果校验**；不要用它在聊天窗口里点"发送"这类不可逆按钮。
 
+## 环境自检（`status`）
+
+动手前先跑一次，比事后猜快得多。它把 UIA 自动化失败的常见前提一次性摊开：
+
+| 字段 | 为什么重要 |
+|---|---|
+| `elevated` | 未提权时**驱动不了管理员窗口**（UIPI 拦输入）；这种情况会附 `elevation_note` |
+| `session_id` / `interactive_desktop` | 非交互会话/非 Default 桌面下 UIA 与截图都不可用 |
+| `dpi_mode` | 不是 `per-monitor-v2` 时坐标与截图会错位 |
+| `monitors` / `virtual_screen` | 每台显示器的 bounds 与 DPI（决定 OCR 上采样倍数的来源） |
+| `ocr_languages` | 空数组 = 系统没装 OCR 语言包，`ocr`/`clicktext` 直接不可用 |
+| `foreground` | 当前前台窗口——键盘输入会发到这里 |
+| `surfaces` | shell 表面可用性（`-NoSurfaces` 可跳过，省约 100ms） |
+
+实测输出示例（本机）：`Windows 10 Pro 26H2` / build `26300.9711`、session 7、未提权、`per-monitor-v2`、双屏 2880×1920@150% + 1920×1080@100%、OCR 语言包 `zh-Hans-CN`。
+
+> 注意 `os` 字段在无应用清单时会谎报 `6.2`（Win8）——**以 `os_build` 为准**；`os_version` 里的 `ProductName` 在 Win11 上仍写 `Windows 10`，这是系统自身的注册表习惯。
+
 ## 轨迹与错误码（长流程排障）
+
 
 
 加 `-Trace`（或环境变量 `WIN_HARNESS_TRACE=1`）后，每次调用写一行 NDJSON：
